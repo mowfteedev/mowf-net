@@ -224,7 +224,7 @@ Query examples:
 
 ```text
 ?limit=50&cursor=...
-?vlan_id=...
+?vlan_ref_id=5
 ?search=192.168.10
 ```
 
@@ -242,7 +242,7 @@ Response item:
   "assigned_count": 10,
   "reserved_count": 3,
   "available_count": 241,
-  "vlan_id": null,
+  "vlan_ref_id": 5,
   "description": "Lab LAN"
 }
 ```
@@ -254,7 +254,7 @@ Request:
 ```json
 {
   "cidr": "192.168.10.0/24",
-  "vlan_id": null,
+  "vlan_ref_id": 5,
   "description": "Lab LAN"
 }
 ```
@@ -283,7 +283,7 @@ Allowed fields:
 ```json
 {
   "cidr": "192.168.10.0/25",
-  "vlan_id": null,
+  "vlan_ref_id": 5,
   "description": "..."
 }
 ```
@@ -313,7 +313,7 @@ Query:
 
 ```text
 ?limit=50
-&after=192.168.10.20
+&cursor=<opaque>
 &range_start=192.168.10.1
 &range_end=192.168.10.254
 &ip=192.168.10.50
@@ -322,7 +322,8 @@ Query:
 Rules:
 
 - `limit` controls bounded output;
-- `after` is an address cursor for forward scanning;
+- `cursor` is opaque to the client and identifies the next bounded page;
+- `next_cursor` is returned by the server;
 - `range_start/range_end` optionally constrain candidate generation;
 - `ip` performs exact availability lookup;
 - the server must never materialize/render an entire `/1` by default.
@@ -542,19 +543,31 @@ Executes monitoring cleanup + unassign + delete when required.
 
 ## 13. VLAN endpoints
 
-The API shape is defined so Frontend/Backend have a contract, but PM may keep full VLAN CRUD/UI optional if core schedule pressure exists.
+The VLAN/Subnet relationship is mandatory in the Phase-1 domain model. Full VLAN CRUD/UI is optional and must not block the IPAM/Inventory core.
 
 ### GET `/vlans`
 ### POST `/vlans`
-### GET `/vlans/{vlan_id}`
-### PATCH `/vlans/{vlan_id}`
-### DELETE `/vlans/{vlan_id}`
+### GET `/vlans/{vlan_resource_id}`
+### PATCH `/vlans/{vlan_resource_id}`
+### DELETE `/vlans/{vlan_resource_id}`
+
+VLAN response item:
+
+```json
+{
+  "id": 5,
+  "vlan_number": 20,
+  "name": "Servers"
+}
+```
+
+VLAN create/update DTOs use `vlan_number` for the actual VLAN number. `id` and the `{vlan_resource_id}` path parameter identify the VLAN resource. Subnets reference that resource using `vlan_ref_id`.
 
 Delete is blocked while any Subnet references the VLAN:
 
 - `409 VLAN_HAS_SUBNETS`.
 
-Exact validation of the domain field `vlan_id` remains OPEN before INV-06.
+Exact validation of `vlan_number` (stored in database column `vlans.vlan_id`) remains OPEN before INV-06.
 
 ## 14. Monitoring endpoints
 
@@ -688,7 +701,7 @@ Frontend must never assume:
 
 Not blocking M1:
 
-1. exact VLAN ID validation payload and codes;
+1. exact VLAN number (`vlan_number`) validation payload and codes;
 2. disabled-monitoring dashboard semantics;
 3. split-origin vs same-origin cookie/CORS details;
 4. optional advanced search/filter parameters beyond the baseline;

@@ -12,7 +12,7 @@
 erDiagram
     USERS ||--o{ SESSIONS : has
     DEVICES ||--o{ DEVICE_INTERFACES : owns
-    VLANS ||--o{ SUBNETS : groups
+    VLANS o|--o{ SUBNETS : groups
     SUBNETS ||--o{ IP_ALLOCATIONS : contains
     DEVICE_INTERFACES o|--o| IP_ALLOCATIONS : assigned_to
     DEVICES ||--o| MONITORING_CHECKS : has_main_check
@@ -56,14 +56,14 @@ erDiagram
 
     VLANS {
         bigint id PK
-        int vlan_id
+        int vlan_id "actual VLAN number"
         string name
         string description
     }
 
     SUBNETS {
         bigint id PK
-        bigint vlan_id FK_NULL
+        bigint vlan_ref_id FK_NULL
         string network
         int prefix_length
         string description
@@ -126,9 +126,11 @@ Only `reserved` and `assigned` allocations exist as rows.
 ### VLAN → Subnet
 
 ```text
-1 VLAN → N Subnets
+1 VLAN → 0..N Subnets
 1 Subnet → 0..1 VLAN
 ```
+
+`vlans.id` is the database primary key/resource identity. `vlans.vlan_id` is the actual VLAN number. The nullable `subnets.vlan_ref_id` references `vlans.id`.
 
 ### Device → Monitoring Check
 
@@ -223,12 +225,13 @@ Session tokens and CSRF tokens are stored as non-plaintext token hashes where ap
 ### `vlans`
 
 - PK: `id`.
-- exact CHECK/UNIQUE policy for `vlan_id` remains OPEN before INV-06.
+- `vlan_id` stores the actual VLAN number; it is distinct from resource identity `id`.
+- exact CHECK/UNIQUE policy for the VLAN number column `vlan_id` remains OPEN before INV-06.
 
 ### `subnets`
 
 - PK: `id`.
-- nullable FK `vlan_id → vlans.id` with `ON DELETE RESTRICT` semantics.
+- nullable FK `vlan_ref_id → vlans.id` with `ON DELETE RESTRICT` semantics.
 - `network INET NOT NULL`.
 - `prefix_length SMALLINT NOT NULL`.
 - `CHECK(family(network) = 4)`.

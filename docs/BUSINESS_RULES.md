@@ -267,12 +267,14 @@ M0 therefore does not invent a uniqueness rule. IDs are authoritative until an e
 
 ## 7. VLAN rules
 
-### VLAN-01 — Relationship — BASELINE
+### VLAN-01 — Relationship — M0-LOCKED
 
 ```text
-1 VLAN → N Subnets
+1 VLAN → 0..N Subnets
 1 Subnet → 0..1 VLAN
 ```
+
+The relationship is mandatory in the Phase-1 domain model. A Subnet's optional `vlan_ref_id` references VLAN resource/database `id`.
 
 ### VLAN-02 — Delete VLAN — LOCKED behavior
 
@@ -284,11 +286,13 @@ A Subnet referencing a VLAN may be deleted if the Subnet otherwise satisfies its
 
 ### VLAN-04 — Exact VLAN validation — OPEN
 
-Exact `vlan_id` validation/DB constraints remain to be locked before INV-06.
+Database `vlans.id` is the VLAN resource primary key. Database `vlans.vlan_id` is the actual VLAN number; its exact validation/DB constraints remain OPEN before INV-06.
 
-### VLAN-05 — Delivery priority — PM DECISION REQUIRED
+API/domain terminology is `id` for VLAN resource identity, `vlan_number` for the actual VLAN number, and `vlan_ref_id` for a Subnet reference to VLAN resource `id`.
 
-The domain relationship is part of Phase 1. Full VLAN CRUD/UI may remain optional if core schedule pressure exists. PM owns the final priority decision.
+### VLAN-05 — Delivery priority — OPTIONAL
+
+The VLAN/Subnet domain relationship is mandatory in Phase 1. Full VLAN CRUD/UI is optional and must not block the IPAM/Inventory core.
 
 ## 8. Monitoring rules
 
@@ -296,7 +300,7 @@ The domain relationship is part of Phase 1. Full VLAN CRUD/UI may remain optiona
 
 ICMP only. No SNMP.
 
-### MON-02 — One main check per Device — BASELINE
+### MON-02 — One main check per Device — M0-LOCKED
 
 A Device has at most one main ICMP Monitoring Check in Phase 1.
 
@@ -331,7 +335,7 @@ Time of the latest successful ICMP response for the current target.
 
 It does not mean “last time any traffic from the Device was observed”.
 
-### MON-07 — Retry threshold — BASELINE
+### MON-07 — Retry threshold — M0-LOCKED
 
 Do not mark OFFLINE after one failed check.
 
@@ -389,7 +393,7 @@ Do not start a new monitoring cycle while the previous cycle is still running.
 
 One Monitoring Check has at most one active job at a time.
 
-### MON-11 — Immediate Check — BASELINE
+### MON-11 — Immediate Check — M0-LOCKED
 
 Immediate check is triggered when:
 
@@ -446,7 +450,7 @@ No registration, multi-user or RBAC.
 
 Store only `password_hash`. Never plaintext password.
 
-### AUTH-03 — Bootstrap — BASELINE
+### AUTH-03 — Bootstrap — M0-LOCKED
 
 Admin bootstrap must be idempotent:
 
@@ -457,7 +461,7 @@ else → hash password → create admin
 
 `username` must be unique.
 
-### AUTH-04 — Session auth — BASELINE
+### AUTH-04 — Session auth — M0-LOCKED
 
 Use server-side session authentication with an HttpOnly cookie rather than access/refresh JWT complexity.
 

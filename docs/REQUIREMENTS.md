@@ -34,7 +34,7 @@ The Administrator can:
 - reserve and unreserve IPv4 addresses;
 - manage Devices and Interfaces;
 - assign and unassign IPv4 addresses to Interfaces;
-- manage the VLAN/Subnet relationship at the level approved for Phase 1;
+- manage the mandatory VLAN/Subnet domain relationship (`1 VLAN → 0..N Subnets`; `1 Subnet → 0..1 VLAN`);
 - configure Basic ICMP Monitoring;
 - view Dashboard summaries;
 - search/filter the inventory.
@@ -161,7 +161,8 @@ Search/filter may cover:
 - `1 Device → N Interfaces`.
 - At most one assigned IPv4 per Interface in Phase 1.
 - IP Allocation linked to Interface.
-- VLAN/Subnet relationship represented in the domain model.
+- VLAN/Subnet relationship represented in the domain model: `1 VLAN → 0..N Subnets`; `1 Subnet → 0..1 VLAN`.
+- Subnet VLAN references use `vlan_ref_id`, which identifies the VLAN resource; the VLAN number is exposed as `vlan_number`.
 
 ### Basic Monitoring
 
@@ -193,13 +194,13 @@ Search/filter may cover:
 
 The following must not delay the mandatory IPAM/Inventory core:
 
-- full VLAN CRUD/UI polish;
+- full VLAN CRUD/UI;
 - advanced filtering;
 - Basic ICMP Discovery;
 - unknown active IP detection;
 - non-essential UI improvements.
 
-The VLAN/Subnet **domain relationship** remains represented even if full VLAN UI is deferred.
+The VLAN/Subnet **domain relationship is mandatory** even if full VLAN CRUD/UI is deferred. Full VLAN CRUD/UI is **OPTIONAL** and must not block the mandatory IPAM/Inventory core.
 
 ## 6. Explicitly out of scope — LOCKED
 
@@ -323,6 +324,8 @@ No hard latency/SLA claim is part of M0. Claims such as “response time < 1s”
 | M0-TD-04 | Interface ownership (`device_id`) is immutable through normal Interface update in Phase 1; moving an Interface requires recreate/dedicated future workflow. | M0-LOCKED |
 | M0-TD-05 | Monitoring target removal keeps the Monitoring Check, clears the target and resets monitoring state to `UNKNOWN`. | M0-LOCKED |
 | M0-TD-06 | Available-IP queries are generated on demand; the API never enumerates an entire huge Subnet by default. | M0-LOCKED |
+| M0-TD-07 | The VLAN/Subnet domain relationship is mandatory (`1 VLAN → 0..N Subnets`; `1 Subnet → 0..1 VLAN`), while full VLAN CRUD/UI is optional and must not block the IPAM/Inventory core. | M0-LOCKED |
+| M0-TD-08 | VLAN API/domain identifiers are unambiguous: `id` is resource identity, `vlan_number` is the VLAN number, and Subnets reference the resource through `vlan_ref_id`. | M0-LOCKED |
 
 These decisions resolve previously OPEN implementation choices and do not modify any prior LOCKED architecture decision.
 
@@ -330,13 +333,12 @@ These decisions resolve previously OPEN implementation choices and do not modify
 
 These do not block M1 unless explicitly stated otherwise.
 
-1. **VLAN ID validation details** — exact allowed range/format and DB checks must be finalized before INV-06.  
-2. **Full VLAN functionality priority** — relationship is in the model, but PM must decide whether full CRUD/UI is mandatory or optional for the final Phase-1 delivery.  
-3. **Disabled Monitoring dashboard semantics** — must be finalized before M6/M7; no new `DISABLED` monitoring state may be introduced without an Architecture Change Request because the locked state set is `UNKNOWN/ONLINE/OFFLINE`.  
-4. **Exact ICMP implementation on Go/Linux** — raw socket/unprivileged ping/capability/container mechanism to be selected before MON-03.  
-5. **React + session-cookie development topology** — same-origin vs split-origin development must be selected before Auth/Frontend integration; CORS/SameSite/credentials behavior follows that choice.  
-6. **Device/Interface/MAC naming uniqueness** — no uniqueness rule is added in M0 because baseline does not define one; IDs remain authoritative until a business rule is explicitly approved.  
-7. **`network-monitor` production role** — intentionally Future/Phase 2; no Phase-1 decision required.
+1. **VLAN number validation details** — exact allowed range/format and DB checks for database `vlans.vlan_id` (API `vlan_number`) must be finalized before INV-06.
+2. **Disabled Monitoring dashboard semantics** — must be finalized before M6/M7; no new `DISABLED` monitoring state may be introduced without an Architecture Change Request because the locked state set is `UNKNOWN/ONLINE/OFFLINE`.
+3. **Exact ICMP implementation on Go/Linux** — raw socket/unprivileged ping/capability/container mechanism to be selected before MON-03.
+4. **React + session-cookie development topology** — same-origin vs split-origin development must be selected before Auth/Frontend integration; CORS/SameSite/credentials behavior follows that choice.
+5. **Device/Interface/MAC naming uniqueness** — no uniqueness rule is added in M0 because the approved rules do not define one; IDs remain authoritative until a business rule is explicitly approved.
+6. **`network-monitor` production role** — intentionally Future/Phase 2; no Phase-1 decision required.
 
 ## 11. M0-01 acceptance
 

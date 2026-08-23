@@ -99,8 +99,9 @@ func ParseCIDR(s string) (CIDR, error) {
 }
 
 // NewCIDRFromParts constructs and validates a CIDR from network IP string and prefix length integer.
+// It enforces the exact same strict canonical format as ParseCIDR without silent trimming.
 func NewCIDRFromParts(networkIP string, prefixLength int) (CIDR, error) {
-	return ParseCIDR(fmt.Sprintf("%s/%d", strings.TrimSpace(networkIP), prefixLength))
+	return ParseCIDR(fmt.Sprintf("%s/%d", networkIP, prefixLength))
 }
 
 // Network returns the network address as a string.

@@ -158,6 +158,9 @@ func TestParseCIDR_RejectUnsupportedPrefixes(t *testing.T) {
 			if !errors.Is(err, ErrInvalidCIDR) {
 				t.Errorf("ParseCIDR(%q) error %v should wrap ErrInvalidCIDR", tt.input, err)
 			}
+			if !errors.Is(err, ErrUnsupportedPrefixLength) {
+				t.Errorf("ParseCIDR(%q) error %v should wrap specific sentinel ErrUnsupportedPrefixLength", tt.input, err)
+			}
 		})
 	}
 }
@@ -182,6 +185,9 @@ func TestParseCIDR_RejectIPv6(t *testing.T) {
 			}
 			if !errors.Is(err, ErrInvalidCIDR) {
 				t.Errorf("ParseCIDR(%q) error %v should wrap ErrInvalidCIDR", tt.input, err)
+			}
+			if !errors.Is(err, ErrIPv6NotSupported) {
+				t.Errorf("ParseCIDR(%q) error %v should wrap specific sentinel ErrIPv6NotSupported", tt.input, err)
 			}
 		})
 	}
@@ -211,32 +217,36 @@ func TestParseCIDR_RejectNonCanonical(t *testing.T) {
 			if !errors.Is(err, ErrInvalidCIDR) {
 				t.Errorf("ParseCIDR(%q) error %v should wrap ErrInvalidCIDR", tt.input, err)
 			}
+			if !errors.Is(err, ErrNonCanonicalCIDR) {
+				t.Errorf("ParseCIDR(%q) error %v should wrap specific sentinel ErrNonCanonicalCIDR", tt.input, err)
+			}
 		})
 	}
 }
 
 func TestParseCIDR_RejectInvalidSyntax(t *testing.T) {
 	tests := []struct {
-		name  string
-		input string
+		name           string
+		input          string
+		expectSpecific error
 	}{
-		{"empty string", ""},
-		{"whitespace only", "   "},
-		{"missing slash", "192.168.1.0"},
-		{"multiple slashes", "192.168.1.0/24/24"},
-		{"alphabetic prefix", "192.168.1.0/abc"},
-		{"prefix with plus", "192.168.1.0/+24"},
-		{"prefix with leading zero 024", "192.168.1.0/024"},
-		{"prefix with leading zero 08", "10.0.0.0/08"},
-		{"octet out of range", "256.0.0.0/24"},
-		{"octet 999", "999.999.999.999/24"},
-		{"five octets", "192.168.1.0.1/24"},
-		{"three octets", "192.168.1/24"},
-		{"leading zero in octet", "192.168.01.0/24"},
-		{"alphabetic IP", "abc.def.ghi.jkl/24"},
-		{"leading space", " 192.168.1.0/24"},
-		{"trailing space", "192.168.1.0/24 "},
-		{"random text", "invalid cidr format"},
+		{"empty string", "", ErrInvalidCIDR},
+		{"whitespace only", "   ", ErrInvalidCIDR},
+		{"missing slash", "192.168.1.0", ErrInvalidCIDR},
+		{"multiple slashes", "192.168.1.0/24/24", ErrInvalidCIDR},
+		{"alphabetic prefix", "192.168.1.0/abc", ErrUnsupportedPrefixLength},
+		{"prefix with plus", "192.168.1.0/+24", ErrUnsupportedPrefixLength},
+		{"prefix with leading zero 024", "192.168.1.0/024", ErrUnsupportedPrefixLength},
+		{"prefix with leading zero 08", "10.0.0.0/08", ErrUnsupportedPrefixLength},
+		{"octet out of range", "256.0.0.0/24", ErrInvalidIPSyntax},
+		{"octet 999", "999.999.999.999/24", ErrInvalidIPSyntax},
+		{"five octets", "192.168.1.0.1/24", ErrInvalidIPSyntax},
+		{"three octets", "192.168.1/24", ErrInvalidIPSyntax},
+		{"leading zero in octet", "192.168.01.0/24", ErrInvalidIPSyntax},
+		{"alphabetic IP", "abc.def.ghi.jkl/24", ErrInvalidIPSyntax},
+		{"leading space", " 192.168.1.0/24", ErrInvalidCIDR},
+		{"trailing space", "192.168.1.0/24 ", ErrInvalidCIDR},
+		{"random text", "invalid cidr format", ErrInvalidCIDR},
 	}
 
 	for _, tt := range tests {
@@ -247,6 +257,9 @@ func TestParseCIDR_RejectInvalidSyntax(t *testing.T) {
 			}
 			if !errors.Is(err, ErrInvalidCIDR) {
 				t.Errorf("ParseCIDR(%q) error %v should wrap ErrInvalidCIDR", tt.input, err)
+			}
+			if tt.expectSpecific != nil && !errors.Is(err, tt.expectSpecific) {
+				t.Errorf("ParseCIDR(%q) error %v should wrap expected specific sentinel %v", tt.input, err, tt.expectSpecific)
 			}
 		})
 	}
@@ -268,12 +281,28 @@ func TestNewCIDRFromParts(t *testing.T) {
 		if err == nil {
 			t.Fatalf("expected error for non-canonical network IP, got nil")
 		}
+		if !errors.Is(err, ErrNonCanonicalCIDR) {
+			t.Errorf("expected ErrNonCanonicalCIDR, got %v", err)
+		}
 	})
 
 	t.Run("unsupported prefix part /31", func(t *testing.T) {
 		_, err := NewCIDRFromParts("192.168.1.0", 31)
 		if err == nil {
 			t.Fatalf("expected error for /31, got nil")
+		}
+		if !errors.Is(err, ErrUnsupportedPrefixLength) {
+			t.Errorf("expected ErrUnsupportedPrefixLength, got %v", err)
+		}
+	})
+
+	t.Run("strict whitespace rejection", func(t *testing.T) {
+		_, err := NewCIDRFromParts(" 192.168.1.0 ", 24)
+		if err == nil {
+			t.Fatalf("expected error for untrimmed whitespace network IP, got nil")
+		}
+		if !errors.Is(err, ErrInvalidCIDR) {
+			t.Errorf("expected ErrInvalidCIDR, got %v", err)
 		}
 	})
 }
@@ -357,6 +386,24 @@ func TestCIDR_Overlaps(t *testing.T) {
 			cidrB:           "172.16.0.0/12",
 			expectedOverlap: false,
 		},
+		{
+			name:            "boundary /1 lower vs upper half (no overlap)",
+			cidrA:           "0.0.0.0/1",
+			cidrB:           "128.0.0.0/1",
+			expectedOverlap: false,
+		},
+		{
+			name:            "adjacent /30 subnets (no overlap)",
+			cidrA:           "192.168.1.0/30",
+			cidrB:           "192.168.1.4/30",
+			expectedOverlap: false,
+		},
+		{
+			name:            "boundary /1 contains /30 at top of range (overlap)",
+			cidrA:           "0.0.0.0/1",
+			cidrB:           "127.255.255.252/30",
+			expectedOverlap: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -370,11 +417,13 @@ func TestCIDR_Overlaps(t *testing.T) {
 				t.Fatalf("ParseCIDR(%q) error: %v", tt.cidrB, err)
 			}
 
+			// Forward check
 			if got := a.Overlaps(b); got != tt.expectedOverlap {
 				t.Errorf("(%s).Overlaps(%s) = %v, want %v", tt.cidrA, tt.cidrB, got, tt.expectedOverlap)
 			}
+			// Symmetry check: A.Overlaps(B) must equal B.Overlaps(A)
 			if got := b.Overlaps(a); got != tt.expectedOverlap {
-				t.Errorf("(%s).Overlaps(%s) = %v, want %v", tt.cidrB, tt.cidrA, got, tt.expectedOverlap)
+				t.Errorf("Symmetry failed: (%s).Overlaps(%s) = %v, want %v", tt.cidrB, tt.cidrA, got, tt.expectedOverlap)
 			}
 		})
 	}

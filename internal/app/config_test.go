@@ -5,19 +5,54 @@ import (
 )
 
 func TestLoadConfig_Defaults(t *testing.T) {
+	// Explicitly isolate all config environment variables so tests do not inherit shell/CI environment
+	envVars := []string{
+		"HTTP_PORT",
+		"HTTP_ADDR",
+		"DB_HOST",
+		"DB_PORT",
+		"DB_USER",
+		"DB_PASSWORD",
+		"DB_NAME",
+		"DB_SSLMODE",
+		"DB_MAX_OPEN_CONNS",
+		"DB_MAX_IDLE_CONNS",
+	}
+	for _, k := range envVars {
+		t.Setenv(k, "")
+	}
+
 	cfg, err := LoadConfig()
 	if err != nil {
 		t.Fatalf("LoadConfig() unexpected error: %v", err)
 	}
 
-	if cfg.HTTPAddr != ":8080" && cfg.HTTPAddr != "8080" {
-		t.Errorf("expected default HTTPAddr :8080, got %s", cfg.HTTPAddr)
+	if cfg.HTTPAddr != ":8080" {
+		t.Errorf("HTTPAddr = %s, want :8080", cfg.HTTPAddr)
 	}
 	if cfg.Database.Host != "127.0.0.1" {
-		t.Errorf("expected default DB Host 127.0.0.1, got %s", cfg.Database.Host)
+		t.Errorf("Database.Host = %s, want 127.0.0.1", cfg.Database.Host)
 	}
 	if cfg.Database.Port != 5432 {
-		t.Errorf("expected default DB Port 5432, got %d", cfg.Database.Port)
+		t.Errorf("Database.Port = %d, want 5432", cfg.Database.Port)
+	}
+	if cfg.Database.User != "postgres" {
+		t.Errorf("Database.User = %s, want postgres", cfg.Database.User)
+	}
+	if cfg.Database.Password != "postgres" {
+		t.Errorf("Database.Password = %s, want postgres", cfg.Database.Password)
+	}
+	if cfg.Database.Database != "mowf_net" {
+		t.Errorf("Database.Database = %s, want mowf_net", cfg.Database.Database)
+	}
+	if cfg.Database.SSLMode != "disable" {
+		t.Errorf("Database.SSLMode = %s, want disable", cfg.Database.SSLMode)
+	}
+	if cfg.Database.MaxOpenConns != 25 {
+		t.Errorf("Database.MaxOpenConns = %d, want 25", cfg.Database.MaxOpenConns)
+	}
+	if cfg.Database.MaxIdleConns != 25 {
+		t.Errorf("Database.MaxIdleConns = %d, want 25", cfg.Database.MaxIdleConns)
 	}
 }
 

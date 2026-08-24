@@ -101,34 +101,75 @@ func TestSubnetHandler_CreateSubnet_Success(t *testing.T) {
 }
 
 func TestSubnetHandler_CreateSubnet_MalformedJSON(t *testing.T) {
-	mux := setupTestServer(&mockSubnetRepo{})
+	var repoCalled bool
+	repo := &mockSubnetRepo{
+		createFn: func(ctx context.Context, subnet *domain.Subnet) error {
+			repoCalled = true
+			return nil
+		},
+	}
+	mux := setupTestServer(repo)
 
-	malformedBodies := []string{
-		`{invalid-json`,
-		`{"cidr": "192.168.1.0/24", "vlan_ref_id": "not-a-number"}`,
-		``,
-		`   `,
+	malformedBodies := []struct {
+		name string
+		body string
+	}{
+		{"invalid syntax", `{invalid-json`},
+		{"type mismatch", `{"cidr": "192.168.1.0/24", "vlan_ref_id": "not-a-number"}`},
+		{"empty string", ``},
+		{"whitespace only", `   `},
+		{"valid object with trailing garbage", `{"cidr":"192.168.10.0/24"} garbage`},
+		{"valid object with second JSON object", `{"cidr":"192.168.10.0/24"} {"another":"object"}`},
+		{"valid object with trailing number", `{"cidr":"192.168.10.0/24"} 123`},
 	}
 
-	for _, body := range malformedBodies {
-		req := httptest.NewRequest(http.MethodPost, "/api/v1/subnets", bytes.NewBufferString(body))
-		req.Header.Set("Content-Type", "application/json")
-		w := httptest.NewRecorder()
+	for _, tt := range malformedBodies {
+		t.Run(tt.name, func(t *testing.T) {
+			repoCalled = false
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/subnets", bytes.NewBufferString(tt.body))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
 
-		mux.ServeHTTP(w, req)
+			mux.ServeHTTP(w, req)
 
-		if w.Code != http.StatusBadRequest {
-			t.Fatalf("expected status 400 Bad Request, got %d. Body: %s", w.Code, w.Body.String())
-		}
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("expected status 400 Bad Request, got %d. Body: %s", w.Code, w.Body.String())
+			}
 
-		var errResp ipamhttp.ErrorResponse
-		if err := json.NewDecoder(w.Body).Decode(&errResp); err != nil {
-			t.Fatalf("failed to decode error response: %v", err)
-		}
+			var errResp ipamhttp.ErrorResponse
+			if err := json.NewDecoder(w.Body).Decode(&errResp); err != nil {
+				t.Fatalf("failed to decode error response: %v", err)
+			}
 
-		if errResp.Error.Code != "INVALID_REQUEST" {
-			t.Errorf("error.code = %s, want INVALID_REQUEST for malformed body %q", errResp.Error.Code, body)
-		}
+			if errResp.Error.Code != "INVALID_REQUEST" {
+				t.Errorf("error.code = %s, want INVALID_REQUEST for %s", errResp.Error.Code, tt.name)
+			}
+
+			if repoCalled {
+				t.Errorf("repository must not be called when request payload is malformed for %s", tt.name)
+			}
+		})
+	}
+}
+
+func TestSubnetHandler_CreateSubnet_TrailingWhitespace_Accepted(t *testing.T) {
+	repo := &mockSubnetRepo{
+		createFn: func(ctx context.Context, subnet *domain.Subnet) error {
+			subnet.ID = 10
+			return nil
+		},
+	}
+	mux := setupTestServer(repo)
+
+	body := `{"cidr":"192.168.10.0/24","vlan_ref_id":null,"description":"Lab LAN"}   ` + "\n\t  \n"
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/subnets", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected status 201 Created for trailing whitespace, got %d. Body: %s", w.Code, w.Body.String())
 	}
 }
 

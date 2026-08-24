@@ -3,6 +3,7 @@ package http
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 
 	"github.com/mowfteedev/mowf-net/internal/ipam/domain"
@@ -49,7 +50,12 @@ func (h *SubnetHandler) CreateSubnet(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req service.CreateSubnetRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	dec := json.NewDecoder(r.Body)
+	if err := dec.Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "INVALID_REQUEST", "Invalid request payload")
+		return
+	}
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
 		writeError(w, http.StatusBadRequest, "INVALID_REQUEST", "Invalid request payload")
 		return
 	}

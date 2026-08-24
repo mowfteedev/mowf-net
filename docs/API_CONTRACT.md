@@ -117,6 +117,7 @@ Common HTTP statuses:
 Core error codes:
 
 ```text
+INVALID_REQUEST
 INVALID_CIDR
 SUBNET_OVERLAP
 SUBNET_RESIZE_CONFLICT
@@ -126,6 +127,7 @@ IP_ALREADY_ALLOCATED
 IP_NOT_ASSIGNABLE
 INTERFACE_ALREADY_ASSIGNED
 VLAN_HAS_SUBNETS
+VLAN_NOT_FOUND
 DEVICE_NOT_FOUND
 INTERFACE_NOT_FOUND
 SUBNET_NOT_FOUND
@@ -267,10 +269,12 @@ Rules:
 
 Success: `201 Created`.
 
-Conflicts:
+Failures:
 
-- `400 INVALID_CIDR`;
-- `409 SUBNET_OVERLAP`.
+- `400 INVALID_REQUEST` (malformed/unparseable request payload);
+- `400 INVALID_CIDR` (invalid or non-canonical CIDR);
+- `404 VLAN_NOT_FOUND` (referenced `vlan_ref_id` does not exist);
+- `409 SUBNET_OVERLAP` (overlaps with an existing subnet).
 
 ### GET `/subnets/{subnet_id}`
 

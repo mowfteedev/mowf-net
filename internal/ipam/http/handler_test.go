@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -99,6 +100,38 @@ func TestSubnetHandler_CreateSubnet_Success(t *testing.T) {
 	}
 }
 
+func TestSubnetHandler_CreateSubnet_MalformedJSON(t *testing.T) {
+	mux := setupTestServer(&mockSubnetRepo{})
+
+	malformedBodies := []string{
+		`{invalid-json`,
+		`{"cidr": "192.168.1.0/24", "vlan_ref_id": "not-a-number"}`,
+		``,
+		`   `,
+	}
+
+	for _, body := range malformedBodies {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/subnets", bytes.NewBufferString(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+
+		mux.ServeHTTP(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("expected status 400 Bad Request, got %d. Body: %s", w.Code, w.Body.String())
+		}
+
+		var errResp ipamhttp.ErrorResponse
+		if err := json.NewDecoder(w.Body).Decode(&errResp); err != nil {
+			t.Fatalf("failed to decode error response: %v", err)
+		}
+
+		if errResp.Error.Code != "INVALID_REQUEST" {
+			t.Errorf("error.code = %s, want INVALID_REQUEST for malformed body %q", errResp.Error.Code, body)
+		}
+	}
+}
+
 func TestSubnetHandler_CreateSubnet_InvalidCIDR(t *testing.T) {
 	mux := setupTestServer(&mockSubnetRepo{})
 
@@ -110,7 +143,7 @@ func TestSubnetHandler_CreateSubnet_InvalidCIDR(t *testing.T) {
 		{"unsupported /31", `{"cidr":"192.168.10.0/31"}`},
 		{"unsupported /32", `{"cidr":"192.168.10.1/32"}`},
 		{"IPv6", `{"cidr":"2001:db8::/32"}`},
-		{"malformed JSON", `{invalid-json`},
+		{"invalid format", `{"cidr":"not-an-ip"}`},
 	}
 
 	for _, tt := range tests {
@@ -140,6 +173,35 @@ func TestSubnetHandler_CreateSubnet_InvalidCIDR(t *testing.T) {
 	}
 }
 
+func TestSubnetHandler_CreateSubnet_VlanNotFound(t *testing.T) {
+	repo := &mockSubnetRepo{
+		createFn: func(ctx context.Context, subnet *domain.Subnet) error {
+			return domain.ErrVlanNotFound
+		},
+	}
+	mux := setupTestServer(repo)
+
+	body := `{"cidr":"192.168.10.0/24","vlan_ref_id":99999}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/subnets", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected status 404 Not Found, got %d. Body: %s", w.Code, w.Body.String())
+	}
+
+	var errResp ipamhttp.ErrorResponse
+	if err := json.NewDecoder(w.Body).Decode(&errResp); err != nil {
+		t.Fatalf("failed to decode error response: %v", err)
+	}
+
+	if errResp.Error.Code != "VLAN_NOT_FOUND" {
+		t.Errorf("error.code = %s, want VLAN_NOT_FOUND", errResp.Error.Code)
+	}
+}
+
 func TestSubnetHandler_CreateSubnet_Overlap(t *testing.T) {
 	repo := &mockSubnetRepo{
 		createFn: func(ctx context.Context, subnet *domain.Subnet) error {
@@ -166,5 +228,37 @@ func TestSubnetHandler_CreateSubnet_Overlap(t *testing.T) {
 
 	if errResp.Error.Code != "SUBNET_OVERLAP" {
 		t.Errorf("error.code = %s, want SUBNET_OVERLAP", errResp.Error.Code)
+	}
+}
+
+func TestSubnetHandler_CreateSubnet_InternalError_Sanitized(t *testing.T) {
+	repo := &mockSubnetRepo{
+		createFn: func(ctx context.Context, subnet *domain.Subnet) error {
+			return errors.New("pq: connection refused password=secret host=10.0.0.1")
+		},
+	}
+	mux := setupTestServer(repo)
+
+	body := `{"cidr":"192.168.10.0/24"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/subnets", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected status 500 Internal Server Error, got %d. Body: %s", w.Code, w.Body.String())
+	}
+
+	var errResp ipamhttp.ErrorResponse
+	if err := json.NewDecoder(w.Body).Decode(&errResp); err != nil {
+		t.Fatalf("failed to decode error response: %v", err)
+	}
+
+	if errResp.Error.Code != "INTERNAL_ERROR" {
+		t.Errorf("error.code = %s, want INTERNAL_ERROR", errResp.Error.Code)
+	}
+	if bytes.Contains(w.Body.Bytes(), []byte("secret")) || bytes.Contains(w.Body.Bytes(), []byte("10.0.0.1")) {
+		t.Errorf("error response leaked internal details: %s", w.Body.String())
 	}
 }

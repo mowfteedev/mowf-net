@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	embeddedpostgres "github.com/fergusstrange/embedded-postgres"
 	_ "github.com/lib/pq"
@@ -242,7 +243,7 @@ func TestSubnetRepo_Create_VlanRef(t *testing.T) {
 	}
 }
 
-func TestSubnetRepo_Create_ConcurrencySerialization(t *testing.T) {
+func TestSubnetRepo_Create_ConcurrentOutcome(t *testing.T) {
 	db := setupTestDB(t)
 	repo := postgres.NewSubnetRepository(db)
 
@@ -327,7 +328,122 @@ func TestSubnetRepo_Create_ConcurrencySerialization(t *testing.T) {
 	}
 }
 
-func TestSubnetRepo_Create_MultiConcurrencyStress(t *testing.T) {
+func TestSubnetRepo_Create_AdvisoryLockDeterministic(t *testing.T) {
+	db := setupTestDB(t)
+	repo := postgres.NewSubnetRepository(db)
+	ctx := context.Background()
+
+	// Candidates:
+	// A = 10.30.0.0/24
+	// B = 10.30.0.0/25 (subset of A)
+	// Different prefix lengths (/24 vs /25) ensure UNIQUE constraint on (network, prefix_length) cannot prevent overlap.
+	cidrA, err := domain.ParseCIDR("10.30.0.0/24")
+	if err != nil {
+		t.Fatalf("failed to parse CIDR A: %v", err)
+	}
+	cidrB, err := domain.ParseCIDR("10.30.0.0/25")
+	if err != nil {
+		t.Fatalf("failed to parse CIDR B: %v", err)
+	}
+
+	// 1. Transaction A begins and explicitly acquires the shared SubnetCoordinationKey advisory lock
+	txA, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("failed to begin TxA: %v", err)
+	}
+	defer func() { _ = txA.Rollback() }()
+
+	if _, err := txA.ExecContext(ctx, "SELECT pg_advisory_xact_lock($1)", postgres.SubnetCoordinationKey); err != nil {
+		t.Fatalf("TxA failed to acquire advisory lock: %v", err)
+	}
+
+	// 2. Start Transaction B via repo.Create on another connection, which must attempt the same advisory lock
+	type bResult struct {
+		err error
+	}
+	bDone := make(chan bResult, 1)
+
+	go func() {
+		subB := domain.NewSubnet(cidrB, nil, "Subnet B")
+		bErr := repo.Create(context.Background(), &subB)
+		bDone <- bResult{err: bErr}
+	}()
+
+	// 3. Poll PostgreSQL pg_locks to deterministically verify that Transaction B is observed WAITING (NOT granted)
+	var waitingObserved bool
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		var count int
+		query := `
+			SELECT COUNT(*) FROM pg_locks
+			WHERE locktype = 'advisory'
+			  AND NOT granted
+		`
+		err := db.QueryRow(query).Scan(&count)
+		if err == nil && count > 0 {
+			waitingObserved = true
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	if !waitingObserved {
+		t.Fatalf("deterministic assertion failed: Transaction B was not observed waiting on advisory lock in pg_locks")
+	}
+
+	// 4. Verify Transaction B has not finished while TxA holds the lock
+	select {
+	case res := <-bDone:
+		t.Fatalf("Transaction B completed prematurely before TxA committed! Result: %v", res.err)
+	default:
+		// Expected: B is still blocked
+	}
+
+	// 5. Transaction A inserts Subnet A and commits
+	_, err = txA.ExecContext(ctx, `
+		INSERT INTO subnets (network, prefix_length, description, created_at, updated_at)
+		VALUES ($1::inet, $2, $3, NOW(), NOW())
+	`, cidrA.Network(), cidrA.PrefixLength(), "Subnet A")
+	if err != nil {
+		t.Fatalf("TxA failed to insert subnet: %v", err)
+	}
+
+	if err := txA.Commit(); err != nil {
+		t.Fatalf("TxA failed to commit: %v", err)
+	}
+
+	// 6. Now that TxA committed and released the lock, Transaction B unblocks,
+	// acquires the advisory lock, executes overlap check against newly committed state, and returns ErrSubnetOverlap.
+	var resB bResult
+	select {
+	case resB = <-bDone:
+		// Completed
+	case <-time.After(3 * time.Second):
+		t.Fatalf("timed out waiting for Transaction B to complete after TxA commit")
+	}
+
+	if resB.err == nil {
+		t.Fatalf("Transaction B succeeded unexpectedly; wanted ErrSubnetOverlap")
+	}
+	if !errors.Is(resB.err, domain.ErrSubnetOverlap) {
+		t.Fatalf("Transaction B returned unexpected error: %v, want ErrSubnetOverlap", resB.err)
+	}
+
+	// 7. Verify exactly 1 row exists in the 10.30.0.0/16 region
+	var regionCount int
+	err = db.QueryRow(`
+		SELECT COUNT(*) FROM subnets
+		WHERE set_masklen(network, prefix_length) && '10.30.0.0/16'::inet
+	`).Scan(&regionCount)
+	if err != nil {
+		t.Fatalf("failed to query region count: %v", err)
+	}
+	if regionCount != 1 {
+		t.Fatalf("expected exactly 1 row in DB region 10.30.0.0/16, got %d", regionCount)
+	}
+}
+
+func TestSubnetRepo_Create_Stress(t *testing.T) {
 	db := setupTestDB(t)
 	repo := postgres.NewSubnetRepository(db)
 

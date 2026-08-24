@@ -10,8 +10,8 @@ import (
 	"github.com/mowfteedev/mowf-net/internal/ipam/domain"
 )
 
-// SubnetCoordinationKey is the global advisory transaction lock key for serializing subnet create and resize operations.
-const SubnetCoordinationKey int64 = 0x4D4F57465355424E // ASCII for "MOWFSUB"
+// SubnetCoordinationKey is the global advisory transaction lock key (0x4D4F57465355424E) used to serialize subnet create and resize operations.
+const SubnetCoordinationKey int64 = 0x4D4F57465355424E
 
 // SubnetRepository implements repository.SubnetRepository using PostgreSQL.
 type SubnetRepository struct {

@@ -50,7 +50,7 @@ func (h *SubnetHandler) CreateSubnet(w http.ResponseWriter, r *http.Request) {
 
 	var req service.CreateSubnetRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "INVALID_CIDR", "Invalid request payload")
+		writeError(w, http.StatusBadRequest, "INVALID_REQUEST", "Invalid request payload")
 		return
 	}
 
@@ -58,6 +58,10 @@ func (h *SubnetHandler) CreateSubnet(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if errors.Is(err, domain.ErrInvalidCIDR) {
 			writeError(w, http.StatusBadRequest, "INVALID_CIDR", "The provided CIDR is invalid or non-canonical.")
+			return
+		}
+		if errors.Is(err, domain.ErrVlanNotFound) {
+			writeError(w, http.StatusNotFound, "VLAN_NOT_FOUND", "The referenced VLAN was not found.")
 			return
 		}
 		if errors.Is(err, domain.ErrSubnetOverlap) {

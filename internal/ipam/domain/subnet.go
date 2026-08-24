@@ -13,3 +13,12 @@ type Subnet struct {
 	CreatedAt   time.Time
 	UpdatedAt   time.Time
 }
+
+// NewSubnet constructs a Subnet entity with validated domain CIDR.
+func NewSubnet(cidr CIDR, vlanRefID *int64, description string) Subnet {
+	return Subnet{
+		CIDR:        cidr,
+		VlanRefID:   vlanRefID,
+		Description: description,
+	}
+}

@@ -14,4 +14,8 @@ var (
 	ErrUnsupportedPrefixLength = fmt.Errorf("%w: prefix length must be between 1 and 30", ErrInvalidCIDR)
 	ErrIPv6NotSupported        = fmt.Errorf("%w: IPv6 is not supported in Phase 1", ErrInvalidCIDR)
 	ErrInvalidIPSyntax         = fmt.Errorf("%w: invalid IPv4 address format", ErrInvalidCIDR)
+
+	// Subnet domain errors
+	ErrSubnetOverlap = errors.New("SUBNET_OVERLAP")
+	ErrVlanNotFound  = errors.New("VLAN_NOT_FOUND")
 )

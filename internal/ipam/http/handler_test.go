@@ -11,11 +11,14 @@ import (
 
 	"github.com/mowfteedev/mowf-net/internal/ipam/domain"
 	ipamhttp "github.com/mowfteedev/mowf-net/internal/ipam/http"
+	"github.com/mowfteedev/mowf-net/internal/ipam/repository"
 	"github.com/mowfteedev/mowf-net/internal/ipam/service"
 )
 
 type mockSubnetRepo struct {
-	createFn func(ctx context.Context, subnet *domain.Subnet) error
+	createFn  func(ctx context.Context, subnet *domain.Subnet) error
+	getByIDFn func(ctx context.Context, id int64) (*domain.Subnet, error)
+	listFn    func(ctx context.Context, filter repository.ListFilter) ([]*domain.Subnet, *int64, error)
 }
 
 func (m *mockSubnetRepo) Create(ctx context.Context, subnet *domain.Subnet) error {
@@ -26,6 +29,20 @@ func (m *mockSubnetRepo) Create(ctx context.Context, subnet *domain.Subnet) erro
 	return nil
 }
 
+func (m *mockSubnetRepo) GetByID(ctx context.Context, id int64) (*domain.Subnet, error) {
+	if m.getByIDFn != nil {
+		return m.getByIDFn(ctx, id)
+	}
+	return nil, domain.ErrSubnetNotFound
+}
+
+func (m *mockSubnetRepo) List(ctx context.Context, filter repository.ListFilter) ([]*domain.Subnet, *int64, error) {
+	if m.listFn != nil {
+		return m.listFn(ctx, filter)
+	}
+	return nil, nil, nil
+}
+
 func setupTestServer(repo *mockSubnetRepo) *http.ServeMux {
 	svc := service.NewSubnetService(repo)
 	handler := ipamhttp.NewSubnetHandler(svc)
@@ -33,6 +50,10 @@ func setupTestServer(repo *mockSubnetRepo) *http.ServeMux {
 	handler.RegisterRoutes(mux)
 	return mux
 }
+
+// ----------------------------------------------------
+// POST /api/v1/subnets Tests
+// ----------------------------------------------------
 
 func TestSubnetHandler_CreateSubnet_Success(t *testing.T) {
 	repo := &mockSubnetRepo{
@@ -301,5 +322,236 @@ func TestSubnetHandler_CreateSubnet_InternalError_Sanitized(t *testing.T) {
 	}
 	if bytes.Contains(w.Body.Bytes(), []byte("secret")) || bytes.Contains(w.Body.Bytes(), []byte("10.0.0.1")) {
 		t.Errorf("error response leaked internal details: %s", w.Body.String())
+	}
+}
+
+// ----------------------------------------------------
+// GET /api/v1/subnets/{subnet_id} Tests
+// ----------------------------------------------------
+
+func TestSubnetHandler_GetSubnet_Success(t *testing.T) {
+	cidr, _ := domain.ParseCIDR("192.168.10.0/24")
+	vlanRef := int64(5)
+	mockSub := &domain.Subnet{
+		ID:          10,
+		CIDR:        cidr,
+		VlanRefID:   &vlanRef,
+		Description: "Lab LAN",
+	}
+
+	repo := &mockSubnetRepo{
+		getByIDFn: func(ctx context.Context, id int64) (*domain.Subnet, error) {
+			if id == 10 {
+				return mockSub, nil
+			}
+			return nil, domain.ErrSubnetNotFound
+		},
+	}
+	mux := setupTestServer(repo)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/subnets/10", nil)
+	w := httptest.NewRecorder()
+
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200 OK, got %d. Body: %s", w.Code, w.Body.String())
+	}
+
+	var resp struct {
+		Data service.SubnetDTO `json:"data"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	data := resp.Data
+	if data.ID != 10 {
+		t.Errorf("ID = %d, want 10", data.ID)
+	}
+	if data.CIDR != "192.168.10.0/24" {
+		t.Errorf("CIDR = %s, want 192.168.10.0/24", data.CIDR)
+	}
+	if data.UsableCount != 254 {
+		t.Errorf("UsableCount = %d, want 254", data.UsableCount)
+	}
+	if data.AvailableCount != 254 {
+		t.Errorf("AvailableCount = %d, want 254", data.AvailableCount)
+	}
+	if data.VlanRefID == nil || *data.VlanRefID != 5 {
+		t.Errorf("VlanRefID = %v, want 5", data.VlanRefID)
+	}
+}
+
+func TestSubnetHandler_GetSubnet_NotFound(t *testing.T) {
+	repo := &mockSubnetRepo{
+		getByIDFn: func(ctx context.Context, id int64) (*domain.Subnet, error) {
+			return nil, domain.ErrSubnetNotFound
+		},
+	}
+	mux := setupTestServer(repo)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/subnets/999", nil)
+	w := httptest.NewRecorder()
+
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected status 404 Not Found, got %d. Body: %s", w.Code, w.Body.String())
+	}
+
+	var errResp ipamhttp.ErrorResponse
+	if err := json.NewDecoder(w.Body).Decode(&errResp); err != nil {
+		t.Fatalf("failed to decode error response: %v", err)
+	}
+
+	if errResp.Error.Code != "SUBNET_NOT_FOUND" {
+		t.Errorf("error.code = %s, want SUBNET_NOT_FOUND", errResp.Error.Code)
+	}
+}
+
+func TestSubnetHandler_GetSubnet_InvalidPathID(t *testing.T) {
+	mux := setupTestServer(&mockSubnetRepo{})
+
+	invalidPaths := []string{
+		"/api/v1/subnets/abc",
+		"/api/v1/subnets/0",
+		"/api/v1/subnets/-5",
+	}
+
+	for _, path := range invalidPaths {
+		t.Run(path, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, path, nil)
+			w := httptest.NewRecorder()
+
+			mux.ServeHTTP(w, req)
+
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("expected status 400 Bad Request for %s, got %d. Body: %s", path, w.Code, w.Body.String())
+			}
+
+			var errResp ipamhttp.ErrorResponse
+			if err := json.NewDecoder(w.Body).Decode(&errResp); err != nil {
+				t.Fatalf("failed to decode error response: %v", err)
+			}
+
+			if errResp.Error.Code != "INVALID_REQUEST" {
+				t.Errorf("error.code = %s, want INVALID_REQUEST for %s", errResp.Error.Code, path)
+			}
+		})
+	}
+}
+
+func TestSubnetHandler_GetSubnet_InternalError_Sanitized(t *testing.T) {
+	repo := &mockSubnetRepo{
+		getByIDFn: func(ctx context.Context, id int64) (*domain.Subnet, error) {
+			return nil, errors.New("pq: fatal error on db 10.0.0.1 password=secret")
+		},
+	}
+	mux := setupTestServer(repo)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/subnets/10", nil)
+	w := httptest.NewRecorder()
+
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected status 500 Internal Server Error, got %d", w.Code)
+	}
+
+	var errResp ipamhttp.ErrorResponse
+	if err := json.NewDecoder(w.Body).Decode(&errResp); err != nil {
+		t.Fatalf("failed to decode error response: %v", err)
+	}
+
+	if errResp.Error.Code != "INTERNAL_ERROR" {
+		t.Errorf("error.code = %s, want INTERNAL_ERROR", errResp.Error.Code)
+	}
+	if bytes.Contains(w.Body.Bytes(), []byte("secret")) || bytes.Contains(w.Body.Bytes(), []byte("10.0.0.1")) {
+		t.Errorf("error response leaked internal DB details: %s", w.Body.String())
+	}
+}
+
+// ----------------------------------------------------
+// GET /api/v1/subnets Tests
+// ----------------------------------------------------
+
+func TestSubnetHandler_ListSubnets_Success(t *testing.T) {
+	cidr1, _ := domain.ParseCIDR("192.168.1.0/24")
+	cidr2, _ := domain.ParseCIDR("192.168.2.0/24")
+	mockList := []*domain.Subnet{
+		{ID: 1, CIDR: cidr1, Description: "LAN 1"},
+		{ID: 2, CIDR: cidr2, Description: "LAN 2"},
+	}
+
+	repo := &mockSubnetRepo{
+		listFn: func(ctx context.Context, filter repository.ListFilter) ([]*domain.Subnet, *int64, error) {
+			next := int64(2)
+			return mockList, &next, nil
+		},
+	}
+	mux := setupTestServer(repo)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/subnets?limit=2", nil)
+	w := httptest.NewRecorder()
+
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200 OK, got %d. Body: %s", w.Code, w.Body.String())
+	}
+
+	var resp service.ListSubnetsResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	if len(resp.Data) != 2 {
+		t.Fatalf("len(data) = %d, want 2", len(resp.Data))
+	}
+	if resp.Page.Limit != 2 {
+		t.Errorf("page.limit = %d, want 2", resp.Page.Limit)
+	}
+	if resp.Page.NextCursor == nil {
+		t.Fatalf("expected non-nil next_cursor")
+	}
+}
+
+func TestSubnetHandler_ListSubnets_MalformedParameters(t *testing.T) {
+	mux := setupTestServer(&mockSubnetRepo{})
+
+	tests := []struct {
+		name string
+		url  string
+	}{
+		{"invalid limit not integer", "/api/v1/subnets?limit=abc"},
+		{"negative limit", "/api/v1/subnets?limit=-5"},
+		{"zero limit", "/api/v1/subnets?limit=0"},
+		{"invalid cursor not base64", "/api/v1/subnets?cursor=invalid_base64_string!"},
+		{"cursor not numeric base64", "/api/v1/subnets?cursor=YWJj"},
+		{"invalid vlan_ref_id", "/api/v1/subnets?vlan_ref_id=not-int"},
+		{"negative vlan_ref_id", "/api/v1/subnets?vlan_ref_id=-1"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, tt.url, nil)
+			w := httptest.NewRecorder()
+
+			mux.ServeHTTP(w, req)
+
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("expected status 400 Bad Request for %s, got %d. Body: %s", tt.name, w.Code, w.Body.String())
+			}
+
+			var errResp ipamhttp.ErrorResponse
+			if err := json.NewDecoder(w.Body).Decode(&errResp); err != nil {
+				t.Fatalf("failed to decode error response: %v", err)
+			}
+
+			if errResp.Error.Code != "INVALID_REQUEST" {
+				t.Errorf("error.code = %s, want INVALID_REQUEST for %s", errResp.Error.Code, tt.name)
+			}
+		})
 	}
 }

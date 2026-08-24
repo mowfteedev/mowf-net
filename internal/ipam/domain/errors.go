@@ -16,6 +16,8 @@ var (
 	ErrInvalidIPSyntax         = fmt.Errorf("%w: invalid IPv4 address format", ErrInvalidCIDR)
 
 	// Subnet domain errors
-	ErrSubnetOverlap = errors.New("SUBNET_OVERLAP")
-	ErrVlanNotFound  = errors.New("VLAN_NOT_FOUND")
+	ErrSubnetOverlap  = errors.New("SUBNET_OVERLAP")
+	ErrSubnetNotFound = errors.New("SUBNET_NOT_FOUND")
+	ErrVlanNotFound   = errors.New("VLAN_NOT_FOUND")
+	ErrInvalidRequest = errors.New("INVALID_REQUEST")
 )

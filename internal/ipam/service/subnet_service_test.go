@@ -6,10 +6,13 @@ import (
 	"testing"
 
 	"github.com/mowfteedev/mowf-net/internal/ipam/domain"
+	"github.com/mowfteedev/mowf-net/internal/ipam/repository"
 )
 
 type mockSubnetRepo struct {
-	createFn func(ctx context.Context, subnet *domain.Subnet) error
+	createFn  func(ctx context.Context, subnet *domain.Subnet) error
+	getByIDFn func(ctx context.Context, id int64) (*domain.Subnet, error)
+	listFn    func(ctx context.Context, filter repository.ListFilter) ([]*domain.Subnet, *int64, error)
 }
 
 func (m *mockSubnetRepo) Create(ctx context.Context, subnet *domain.Subnet) error {
@@ -18,6 +21,20 @@ func (m *mockSubnetRepo) Create(ctx context.Context, subnet *domain.Subnet) erro
 	}
 	subnet.ID = 1
 	return nil
+}
+
+func (m *mockSubnetRepo) GetByID(ctx context.Context, id int64) (*domain.Subnet, error) {
+	if m.getByIDFn != nil {
+		return m.getByIDFn(ctx, id)
+	}
+	return nil, domain.ErrSubnetNotFound
+}
+
+func (m *mockSubnetRepo) List(ctx context.Context, filter repository.ListFilter) ([]*domain.Subnet, *int64, error) {
+	if m.listFn != nil {
+		return m.listFn(ctx, filter)
+	}
+	return nil, nil, nil
 }
 
 func TestSubnetService_CreateSubnet_Valid(t *testing.T) {
@@ -120,5 +137,142 @@ func TestSubnetService_CreateSubnet_RepoOverlapError(t *testing.T) {
 	}
 	if !errors.Is(err, domain.ErrSubnetOverlap) {
 		t.Errorf("expected ErrSubnetOverlap, got %v", err)
+	}
+}
+
+func TestSubnetService_GetSubnet(t *testing.T) {
+	cidr, _ := domain.ParseCIDR("10.0.0.0/8")
+	vlanRef := int64(7)
+	mockSub := &domain.Subnet{
+		ID:          10,
+		CIDR:        cidr,
+		VlanRefID:   &vlanRef,
+		Description: "Corporate WAN",
+	}
+
+	repo := &mockSubnetRepo{
+		getByIDFn: func(ctx context.Context, id int64) (*domain.Subnet, error) {
+			if id == 10 {
+				return mockSub, nil
+			}
+			return nil, domain.ErrSubnetNotFound
+		},
+	}
+	svc := NewSubnetService(repo)
+
+	t.Run("found", func(t *testing.T) {
+		dto, err := svc.GetSubnet(context.Background(), 10)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if dto.ID != 10 {
+			t.Errorf("ID = %d, want 10", dto.ID)
+		}
+		if dto.CIDR != "10.0.0.0/8" {
+			t.Errorf("CIDR = %s, want 10.0.0.0/8", dto.CIDR)
+		}
+		if dto.UsableCount != 16777214 {
+			t.Errorf("UsableCount = %d, want 16777214", dto.UsableCount)
+		}
+		if dto.AvailableCount != 16777214 {
+			t.Errorf("AvailableCount = %d, want 16777214", dto.AvailableCount)
+		}
+		if dto.VlanRefID == nil || *dto.VlanRefID != 7 {
+			t.Errorf("VlanRefID = %v, want 7", dto.VlanRefID)
+		}
+	})
+
+	t.Run("not found", func(t *testing.T) {
+		_, err := svc.GetSubnet(context.Background(), 999)
+		if err == nil {
+			t.Fatalf("expected error for non-existent ID, got nil")
+		}
+		if !errors.Is(err, domain.ErrSubnetNotFound) {
+			t.Errorf("expected ErrSubnetNotFound, got %v", err)
+		}
+	})
+
+	t.Run("invalid id <= 0", func(t *testing.T) {
+		_, err := svc.GetSubnet(context.Background(), 0)
+		if err == nil {
+			t.Fatalf("expected error for ID 0, got nil")
+		}
+		if !errors.Is(err, domain.ErrSubnetNotFound) {
+			t.Errorf("expected ErrSubnetNotFound for ID 0, got %v", err)
+		}
+	})
+}
+
+func TestSubnetService_ListSubnets(t *testing.T) {
+	cidr1, _ := domain.ParseCIDR("192.168.1.0/24")
+	cidr2, _ := domain.ParseCIDR("192.168.2.0/24")
+	subnets := []*domain.Subnet{
+		{ID: 1, CIDR: cidr1, Description: "LAN 1"},
+		{ID: 2, CIDR: cidr2, Description: "LAN 2"},
+	}
+
+	nextCursorID := int64(2)
+	repo := &mockSubnetRepo{
+		listFn: func(ctx context.Context, filter repository.ListFilter) ([]*domain.Subnet, *int64, error) {
+			return subnets, &nextCursorID, nil
+		},
+	}
+	svc := NewSubnetService(repo)
+
+	resp, err := svc.ListSubnets(context.Background(), ListSubnetsRequest{Limit: 2})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(resp.Data) != 2 {
+		t.Fatalf("len(resp.Data) = %d, want 2", len(resp.Data))
+	}
+	if resp.Page.Limit != 2 {
+		t.Errorf("resp.Page.Limit = %d, want 2", resp.Page.Limit)
+	}
+	if resp.Page.NextCursor == nil {
+		t.Fatalf("expected non-nil NextCursor")
+	}
+
+	decodedID, err := DecodeCursor(*resp.Page.NextCursor)
+	if err != nil {
+		t.Fatalf("failed to decode cursor %q: %v", *resp.Page.NextCursor, err)
+	}
+	if decodedID != 2 {
+		t.Errorf("decoded cursor ID = %d, want 2", decodedID)
+	}
+}
+
+func TestCursorEncodingDecoding(t *testing.T) {
+	tests := []int64{1, 42, 100, 999999999}
+	for _, id := range tests {
+		encoded := EncodeCursor(id)
+		decoded, err := DecodeCursor(encoded)
+		if err != nil {
+			t.Fatalf("DecodeCursor(%q) error: %v", encoded, err)
+		}
+		if decoded != id {
+			t.Errorf("decoded = %d, want %d", decoded, id)
+		}
+	}
+
+	// Invalid cursors
+	invalidCursors := []string{
+		"not-base64-%%%",
+		"YWJj", // base64 for "abc", not a number
+		"MA==", // base64 for "0"
+		"LTE=", // base64 for "-1"
+	}
+	for _, c := range invalidCursors {
+		_, err := DecodeCursor(c)
+		if err == nil {
+			t.Errorf("DecodeCursor(%q) expected error, got nil", c)
+		}
+	}
+
+	// Empty cursor should decode to 0 with no error
+	id, err := DecodeCursor("")
+	if err != nil || id != 0 {
+		t.Errorf("DecodeCursor('') = (%d, %v), want (0, nil)", id, err)
 	}
 }

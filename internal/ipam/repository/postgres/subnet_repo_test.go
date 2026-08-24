@@ -518,3 +518,266 @@ func TestSubnetRepo_Create_Stress(t *testing.T) {
 		t.Fatalf("expected exactly 1 row in DB region 10.20.0.0/16, got %d", regionCount)
 	}
 }
+
+func TestSubnetRepo_GetByID(t *testing.T) {
+	db := setupTestDB(t)
+	repo := postgres.NewSubnetRepository(db)
+	ctx := context.Background()
+
+	// 1. Insert a VLAN
+	var vlanID int64
+	err := db.QueryRow("INSERT INTO vlans (vlan_id, name, description) VALUES (10, 'VLAN 10', '') RETURNING id").Scan(&vlanID)
+	if err != nil {
+		t.Fatalf("failed to insert test VLAN: %v", err)
+	}
+
+	// 2. Insert representative non-overlapping CIDRs including boundary /1 and /30
+	testCases := []struct {
+		cidr        string
+		vlanRefID   *int64
+		description string
+	}{
+		{"0.0.0.0/1", nil, "Boundary /1 subnet (lower half)"},
+		{"128.0.0.0/8", &vlanID, "Class A /8 subnet (upper half)"},
+		{"172.16.0.0/16", nil, "Class B /16 subnet"},
+		{"192.168.1.0/24", &vlanID, "Class C /24 subnet"},
+		{"192.168.2.0/30", nil, "Point-to-point /30 subnet"},
+	}
+
+	for _, tc := range testCases {
+		cidr, err := domain.ParseCIDR(tc.cidr)
+		if err != nil {
+			t.Fatalf("failed to parse CIDR %q: %v", tc.cidr, err)
+		}
+
+		sub := domain.NewSubnet(cidr, tc.vlanRefID, tc.description)
+		if err := repo.Create(ctx, &sub); err != nil {
+			t.Fatalf("Create(%q) failed: %v", tc.cidr, err)
+		}
+
+		// Retrieve by ID
+		fetched, err := repo.GetByID(ctx, sub.ID)
+		if err != nil {
+			t.Fatalf("GetByID(%d) for %q failed: %v", sub.ID, tc.cidr, err)
+		}
+
+		// Verify reconstructed canonical CIDR
+		if fetched.CIDR.CIDR() != tc.cidr {
+			t.Errorf("GetByID CIDR = %s, want %s", fetched.CIDR.CIDR(), tc.cidr)
+		}
+		if fetched.CIDR.Network() != cidr.Network() {
+			t.Errorf("GetByID Network = %s, want %s", fetched.CIDR.Network(), cidr.Network())
+		}
+		if fetched.CIDR.Broadcast() != cidr.Broadcast() {
+			t.Errorf("GetByID Broadcast = %s, want %s", fetched.CIDR.Broadcast(), cidr.Broadcast())
+		}
+		if fetched.CIDR.FirstUsable() != cidr.FirstUsable() {
+			t.Errorf("GetByID FirstUsable = %s, want %s", fetched.CIDR.FirstUsable(), cidr.FirstUsable())
+		}
+		if fetched.CIDR.LastUsable() != cidr.LastUsable() {
+			t.Errorf("GetByID LastUsable = %s, want %s", fetched.CIDR.LastUsable(), cidr.LastUsable())
+		}
+		if fetched.CIDR.UsableCount() != cidr.UsableCount() {
+			t.Errorf("GetByID UsableCount = %d, want %d", fetched.CIDR.UsableCount(), cidr.UsableCount())
+		}
+		if fetched.Description != tc.description {
+			t.Errorf("GetByID Description = %q, want %q", fetched.Description, tc.description)
+		}
+		if tc.vlanRefID == nil && fetched.VlanRefID != nil {
+			t.Errorf("GetByID VlanRefID = %v, want nil", fetched.VlanRefID)
+		}
+		if tc.vlanRefID != nil && (fetched.VlanRefID == nil || *fetched.VlanRefID != *tc.vlanRefID) {
+			t.Errorf("GetByID VlanRefID = %v, want %v", fetched.VlanRefID, tc.vlanRefID)
+		}
+		if fetched.CreatedAt.IsZero() || fetched.UpdatedAt.IsZero() {
+			t.Errorf("GetByID timestamps are zero: created=%v, updated=%v", fetched.CreatedAt, fetched.UpdatedAt)
+		}
+	}
+
+	// 3. Test missing ID returns ErrSubnetNotFound
+	_, err = repo.GetByID(ctx, 999999)
+	if err == nil {
+		t.Fatalf("expected error for non-existent ID, got nil")
+	}
+	if !errors.Is(err, domain.ErrSubnetNotFound) {
+		t.Errorf("expected ErrSubnetNotFound, got %v", err)
+	}
+}
+
+func TestSubnetRepo_List_PaginationAndFilters(t *testing.T) {
+	db := setupTestDB(t)
+	repo := postgres.NewSubnetRepository(db)
+	ctx := context.Background()
+
+	// 1. Empty table list
+	emptyList, nextCursor, err := repo.List(ctx, postgres.ListFilter{})
+	if err != nil {
+		t.Fatalf("List on empty table failed: %v", err)
+	}
+	if len(emptyList) != 0 {
+		t.Errorf("len(emptyList) = %d, want 0", len(emptyList))
+	}
+	if nextCursor != nil {
+		t.Errorf("nextCursor = %v, want nil", nextCursor)
+	}
+
+	// 2. Insert test VLANs
+	var vlan10, vlan20 int64
+	err = db.QueryRow("INSERT INTO vlans (vlan_id, name) VALUES (10, 'VLAN 10') RETURNING id").Scan(&vlan10)
+	if err != nil {
+		t.Fatalf("failed to insert VLAN 10: %v", err)
+	}
+	err = db.QueryRow("INSERT INTO vlans (vlan_id, name) VALUES (20, 'VLAN 20') RETURNING id").Scan(&vlan20)
+	if err != nil {
+		t.Fatalf("failed to insert VLAN 20: %v", err)
+	}
+
+	// 3. Insert 5 distinct subnets
+	subnetsToCreate := []struct {
+		cidr string
+		vlan *int64
+		desc string
+	}{
+		{"10.1.0.0/24", &vlan10, "Branch Office 1"},
+		{"10.2.0.0/24", &vlan10, "Branch Office 2"},
+		{"192.168.10.0/24", &vlan20, "Data Center LAN"},
+		{"192.168.20.0/24", &vlan20, "Data Center DMZ"},
+		{"172.16.0.0/16", nil, "Core Network"},
+	}
+
+	for _, s := range subnetsToCreate {
+		cidr, _ := domain.ParseCIDR(s.cidr)
+		sub := domain.NewSubnet(cidr, s.vlan, s.desc)
+		if err := repo.Create(ctx, &sub); err != nil {
+			t.Fatalf("Create(%q) failed: %v", s.cidr, err)
+		}
+	}
+
+	// 4. Test default list returns all 5 in deterministic order (id ASC)
+	allSubnets, next, err := repo.List(ctx, postgres.ListFilter{Limit: 50})
+	if err != nil {
+		t.Fatalf("List failed: %v", err)
+	}
+	if len(allSubnets) != 5 {
+		t.Fatalf("len(allSubnets) = %d, want 5", len(allSubnets))
+	}
+	if next != nil {
+		t.Errorf("next cursor for full list should be nil, got %v", next)
+	}
+	for i := 1; i < len(allSubnets); i++ {
+		if allSubnets[i].ID <= allSubnets[i-1].ID {
+			t.Errorf("subnets are not in deterministic ascending ID order: id[%d]=%d <= id[%d]=%d",
+				i, allSubnets[i].ID, i-1, allSubnets[i-1].ID)
+		}
+	}
+
+	// 5. Test pagination with limit = 2
+	// Page 1
+	p1, c1, err := repo.List(ctx, postgres.ListFilter{Limit: 2})
+	if err != nil {
+		t.Fatalf("Page 1 failed: %v", err)
+	}
+	if len(p1) != 2 {
+		t.Fatalf("len(p1) = %d, want 2", len(p1))
+	}
+	if c1 == nil || *c1 != p1[1].ID {
+		t.Fatalf("c1 = %v, want %d", c1, p1[1].ID)
+	}
+
+	// Page 2
+	p2, c2, err := repo.List(ctx, postgres.ListFilter{Limit: 2, Cursor: c1})
+	if err != nil {
+		t.Fatalf("Page 2 failed: %v", err)
+	}
+	if len(p2) != 2 {
+		t.Fatalf("len(p2) = %d, want 2", len(p2))
+	}
+	if c2 == nil || *c2 != p2[1].ID {
+		t.Fatalf("c2 = %v, want %d", c2, p2[1].ID)
+	}
+
+	// Page 3
+	p3, c3, err := repo.List(ctx, postgres.ListFilter{Limit: 2, Cursor: c2})
+	if err != nil {
+		t.Fatalf("Page 3 failed: %v", err)
+	}
+	if len(p3) != 1 {
+		t.Fatalf("len(p3) = %d, want 1", len(p3))
+	}
+	if c3 != nil {
+		t.Fatalf("expected c3 == nil at end of list, got %v", c3)
+	}
+
+	// Verify no duplicates across pages
+	seenIDs := make(map[int64]bool)
+	allPages := append(append(p1, p2...), p3...)
+	for _, sub := range allPages {
+		if seenIDs[sub.ID] {
+			t.Errorf("duplicate subnet ID %d across pagination pages", sub.ID)
+		}
+		seenIDs[sub.ID] = true
+	}
+	if len(seenIDs) != 5 {
+		t.Errorf("total unique subnets retrieved = %d, want 5", len(seenIDs))
+	}
+
+	// 6. Test filter by vlan_ref_id
+	v10List, _, err := repo.List(ctx, postgres.ListFilter{VlanRefID: &vlan10})
+	if err != nil {
+		t.Fatalf("List vlan 10 failed: %v", err)
+	}
+	if len(v10List) != 2 {
+		t.Fatalf("len(v10List) = %d, want 2", len(v10List))
+	}
+	for _, sub := range v10List {
+		if sub.VlanRefID == nil || *sub.VlanRefID != vlan10 {
+			t.Errorf("subnet %d has vlan %v, want %d", sub.ID, sub.VlanRefID, vlan10)
+		}
+	}
+
+	nonExistentVLAN := int64(99999)
+	vEmptyList, _, err := repo.List(ctx, postgres.ListFilter{VlanRefID: &nonExistentVLAN})
+	if err != nil {
+		t.Fatalf("List non-existent vlan failed: %v", err)
+	}
+	if len(vEmptyList) != 0 {
+		t.Errorf("len(vEmptyList) = %d, want 0", len(vEmptyList))
+	}
+
+	// 7. Test search filter
+	// 7a. Search by IP prefix
+	searchIP, _, err := repo.List(ctx, postgres.ListFilter{Search: "192.168"})
+	if err != nil {
+		t.Fatalf("Search '192.168' failed: %v", err)
+	}
+	if len(searchIP) != 2 {
+		t.Fatalf("len(searchIP) = %d, want 2", len(searchIP))
+	}
+
+	// 7b. Search by exact CIDR
+	searchCIDR, _, err := repo.List(ctx, postgres.ListFilter{Search: "192.168.10.0/24"})
+	if err != nil {
+		t.Fatalf("Search '192.168.10.0/24' failed: %v", err)
+	}
+	if len(searchCIDR) != 1 || searchCIDR[0].CIDR.CIDR() != "192.168.10.0/24" {
+		t.Fatalf("Search exact CIDR failed, got %v", searchCIDR)
+	}
+
+	// 7c. Search by description
+	searchDesc, _, err := repo.List(ctx, postgres.ListFilter{Search: "Branch"})
+	if err != nil {
+		t.Fatalf("Search 'Branch' failed: %v", err)
+	}
+	if len(searchDesc) != 2 {
+		t.Fatalf("len(searchDesc) = %d, want 2", len(searchDesc))
+	}
+
+	// 7d. Search no match
+	searchNoMatch, _, err := repo.List(ctx, postgres.ListFilter{Search: "xyz_not_found"})
+	if err != nil {
+		t.Fatalf("Search no match failed: %v", err)
+	}
+	if len(searchNoMatch) != 0 {
+		t.Errorf("len(searchNoMatch) = %d, want 0", len(searchNoMatch))
+	}
+}

@@ -128,6 +128,10 @@ func (h *SubnetHandler) ListSubnets(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "INVALID_REQUEST", "Invalid limit parameter")
 			return
 		}
+		if parsedLimit > 100 {
+			writeError(w, http.StatusBadRequest, "INVALID_REQUEST", "limit must not exceed 100")
+			return
+		}
 		limit = parsedLimit
 	}
 

@@ -517,6 +517,155 @@ func TestSubnetHandler_ListSubnets_Success(t *testing.T) {
 	}
 }
 
+// TestSubnetHandler_ListSubnets_DefaultLimit verifies that omitting the limit
+// parameter causes the service to receive 50 (the canonical default).
+func TestSubnetHandler_ListSubnets_DefaultLimit(t *testing.T) {
+	var capturedLimit int
+	repo := &mockSubnetRepo{
+		listFn: func(ctx context.Context, filter repository.ListFilter) ([]*domain.Subnet, *int64, error) {
+			capturedLimit = filter.Limit
+			return nil, nil, nil
+		},
+	}
+	mux := setupTestServer(repo)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/subnets", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d. Body: %s", w.Code, w.Body.String())
+	}
+
+	var resp service.ListSubnetsResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	// The canonical default limit is 50; repo must have received it.
+	if capturedLimit != 50 {
+		t.Errorf("repository received limit=%d, want 50", capturedLimit)
+	}
+	if resp.Page.Limit != 50 {
+		t.Errorf("page.limit = %d, want 50", resp.Page.Limit)
+	}
+}
+
+// TestSubnetHandler_ListSubnets_MaxLimit verifies that limit=100 is accepted
+// and the repository receives exactly 100.
+func TestSubnetHandler_ListSubnets_MaxLimit(t *testing.T) {
+	var capturedLimit int
+	repo := &mockSubnetRepo{
+		listFn: func(ctx context.Context, filter repository.ListFilter) ([]*domain.Subnet, *int64, error) {
+			capturedLimit = filter.Limit
+			return nil, nil, nil
+		},
+	}
+	mux := setupTestServer(repo)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/subnets?limit=100", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for limit=100, got %d. Body: %s", w.Code, w.Body.String())
+	}
+
+	var resp service.ListSubnetsResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	if capturedLimit != 100 {
+		t.Errorf("repository received limit=%d, want 100", capturedLimit)
+	}
+	if resp.Page.Limit != 100 {
+		t.Errorf("page.limit = %d, want 100", resp.Page.Limit)
+	}
+}
+
+// TestSubnetHandler_ListSubnets_AboveMaxRejected verifies that limit values
+// exceeding 100 are rejected with 400 INVALID_REQUEST before the repository
+// is ever invoked. Public requests must never be silently clamped.
+func TestSubnetHandler_ListSubnets_AboveMaxRejected(t *testing.T) {
+	tests := []struct {
+		name  string
+		limit string
+	}{
+		{"one above max (101)", "101"},
+		{"well above max (500)", "500"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var repoCalled bool
+			repo := &mockSubnetRepo{
+				listFn: func(ctx context.Context, filter repository.ListFilter) ([]*domain.Subnet, *int64, error) {
+					repoCalled = true
+					return nil, nil, nil
+				},
+			}
+			mux := setupTestServer(repo)
+
+			req := httptest.NewRequest(http.MethodGet, "/api/v1/subnets?limit="+tt.limit, nil)
+			w := httptest.NewRecorder()
+			mux.ServeHTTP(w, req)
+
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("limit=%s: expected 400 INVALID_REQUEST, got %d. Body: %s", tt.limit, w.Code, w.Body.String())
+			}
+
+			var errResp ipamhttp.ErrorResponse
+			if err := json.NewDecoder(w.Body).Decode(&errResp); err != nil {
+				t.Fatalf("failed to decode error response: %v", err)
+			}
+			if errResp.Error.Code != "INVALID_REQUEST" {
+				t.Errorf("error.code = %s, want INVALID_REQUEST", errResp.Error.Code)
+			}
+			if repoCalled {
+				t.Errorf("limit=%s: repository.List must NOT be called for out-of-range limit", tt.limit)
+			}
+		})
+	}
+}
+
+// TestSubnetHandler_ListSubnets_InternalError_Sanitized verifies that a List
+// repository failure producing internal sensitive data is sanitized before
+// returning to the client.
+func TestSubnetHandler_ListSubnets_InternalError_Sanitized(t *testing.T) {
+	repo := &mockSubnetRepo{
+		listFn: func(ctx context.Context, filter repository.ListFilter) ([]*domain.Subnet, *int64, error) {
+			// Simulate a raw DB error containing sensitive internal details.
+			return nil, nil, errors.New("pq: connection failed host=10.0.0.1 password=secret sql=SELECT * FROM subnets")
+		},
+	}
+	mux := setupTestServer(repo)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/subnets", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 Internal Server Error, got %d. Body: %s", w.Code, w.Body.String())
+	}
+
+	var errResp ipamhttp.ErrorResponse
+	if err := json.NewDecoder(w.Body).Decode(&errResp); err != nil {
+		t.Fatalf("failed to decode error response: %v", err)
+	}
+	if errResp.Error.Code != "INTERNAL_ERROR" {
+		t.Errorf("error.code = %s, want INTERNAL_ERROR", errResp.Error.Code)
+	}
+
+	body := w.Body.Bytes()
+	sensitiveTerms := []string{"secret", "10.0.0.1", "SELECT", "pq:", "password", "sql="}
+	for _, term := range sensitiveTerms {
+		if bytes.Contains(body, []byte(term)) {
+			t.Errorf("response body leaked sensitive internal data %q: %s", term, string(body))
+		}
+	}
+}
+
 func TestSubnetHandler_ListSubnets_MalformedParameters(t *testing.T) {
 	mux := setupTestServer(&mockSubnetRepo{})
 
@@ -527,6 +676,7 @@ func TestSubnetHandler_ListSubnets_MalformedParameters(t *testing.T) {
 		{"invalid limit not integer", "/api/v1/subnets?limit=abc"},
 		{"negative limit", "/api/v1/subnets?limit=-5"},
 		{"zero limit", "/api/v1/subnets?limit=0"},
+		{"limit=-1", "/api/v1/subnets?limit=-1"},
 		{"invalid cursor not base64", "/api/v1/subnets?cursor=invalid_base64_string!"},
 		{"cursor not numeric base64", "/api/v1/subnets?cursor=YWJj"},
 		{"invalid vlan_ref_id", "/api/v1/subnets?vlan_ref_id=not-int"},

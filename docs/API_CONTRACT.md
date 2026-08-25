@@ -147,6 +147,20 @@ General lists:
 ?limit=50&cursor=<opaque>
 ```
 
+**Limit contract:**
+
+| Scenario | Behavior |
+|---|---|
+| `limit` omitted | default `50` applied |
+| `1 ≤ limit ≤ 100` | accepted exactly as requested |
+| `limit > 100` | `400 INVALID_REQUEST` |
+| `limit ≤ 0` | `400 INVALID_REQUEST` |
+| `limit` non-numeric | `400 INVALID_REQUEST` |
+
+Default: **50**. Maximum: **100**. Valid range: **1..100**.
+
+Out-of-range or malformed limit values are **never silently clamped** — they are always rejected with `400 INVALID_REQUEST` before any repository access.
+
 The implementation may internally use ID/keyset pagination. Client code treats `cursor` as opaque.
 
 Search/filter parameters are resource-specific.

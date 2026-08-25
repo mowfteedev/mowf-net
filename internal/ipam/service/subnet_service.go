@@ -162,6 +162,14 @@ func (s *SubnetService) ListSubnets(ctx context.Context, req ListSubnetsRequest)
 
 	dtos := make([]*SubnetDTO, len(subnets))
 	for i, sub := range subnets {
+		// TODO(M2): transitional M1 behavior — Tech-Lead-authorized.
+		// assigned_count and reserved_count are hardcoded to 0 because ip_allocations
+		// persistence does not yet exist in M1. available_count therefore equals usable_count.
+		// M2 MUST replace these zero values with actual DB aggregates:
+		//   assigned_count  = COUNT(*) WHERE subnet_id=sub.ID AND status='assigned'
+		//   reserved_count  = COUNT(*) WHERE subnet_id=sub.ID AND status='reserved'
+		//   available_count = usable_count - assigned_count - reserved_count
+		// M2 MUST NOT close until GET /subnets and GET /subnets/{id} use these real counts.
 		dtos[i] = ToDTO(sub, 0, 0)
 	}
 

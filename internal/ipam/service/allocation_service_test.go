@@ -21,8 +21,9 @@ func mustAllocationTestCIDR(t *testing.T, raw string) domain.CIDR {
 }
 
 type mockAllocationRepo struct {
-	listFn  func(context.Context, repository.AllocationListFilter) ([]*domain.Allocation, *int64, error)
-	beginFn func(context.Context) (repository.AllocationReservationTransaction, error)
+	listFn           func(context.Context, repository.AllocationListFilter) ([]*domain.Allocation, *int64, error)
+	beginFn          func(context.Context) (repository.AllocationReservationTransaction, error)
+	beginUnreserveFn func(context.Context) (repository.AllocationUnreservationTransaction, error)
 }
 
 func (m *mockAllocationRepo) List(ctx context.Context, filter repository.AllocationListFilter) ([]*domain.Allocation, *int64, error) {
@@ -37,6 +38,13 @@ func (m *mockAllocationRepo) BeginReservation(ctx context.Context) (repository.A
 		return m.beginFn(ctx)
 	}
 	return nil, errors.New("unexpected BeginReservation call")
+}
+
+func (m *mockAllocationRepo) BeginUnreservation(ctx context.Context) (repository.AllocationUnreservationTransaction, error) {
+	if m.beginUnreserveFn != nil {
+		return m.beginUnreserveFn(ctx)
+	}
+	return nil, errors.New("unexpected BeginUnreservation call")
 }
 
 type mockReservationTransaction struct {
@@ -59,6 +67,29 @@ func (m *mockReservationTransaction) Commit() error {
 }
 
 func (m *mockReservationTransaction) Rollback() error {
+	return m.rollbackFn()
+}
+
+type mockUnreservationTransaction struct {
+	lockFn     func(context.Context, int64) (*domain.Allocation, error)
+	deleteFn   func(context.Context, int64) error
+	commitFn   func() error
+	rollbackFn func() error
+}
+
+func (m *mockUnreservationTransaction) LockAllocation(ctx context.Context, allocationID int64) (*domain.Allocation, error) {
+	return m.lockFn(ctx, allocationID)
+}
+
+func (m *mockUnreservationTransaction) DeleteLockedAllocation(ctx context.Context, allocationID int64) error {
+	return m.deleteFn(ctx, allocationID)
+}
+
+func (m *mockUnreservationTransaction) Commit() error {
+	return m.commitFn()
+}
+
+func (m *mockUnreservationTransaction) Rollback() error {
 	return m.rollbackFn()
 }
 
@@ -200,6 +231,140 @@ func TestAllocationService_ReserveAllocationValidatesAgainstLockedCIDRAndRollsBa
 			}
 			if inserted || !rolledBack {
 				t.Fatalf("inserted=%v rolledBack=%v", inserted, rolledBack)
+			}
+		})
+	}
+}
+
+func TestAllocationService_UnreserveAllocationLocksDeletesAndCommits(t *testing.T) {
+	var order []string
+	tx := &mockUnreservationTransaction{
+		lockFn: func(_ context.Context, allocationID int64) (*domain.Allocation, error) {
+			order = append(order, "lock")
+			return &domain.Allocation{ID: allocationID, Status: domain.AllocationStatusReserved}, nil
+		},
+		deleteFn: func(_ context.Context, allocationID int64) error {
+			order = append(order, "delete")
+			if allocationID != 100 {
+				t.Fatalf("deleted allocation ID = %d, want 100", allocationID)
+			}
+			return nil
+		},
+		commitFn: func() error {
+			order = append(order, "commit")
+			return nil
+		},
+		rollbackFn: func() error {
+			order = append(order, "rollback")
+			return nil
+		},
+	}
+	repo := &mockAllocationRepo{beginUnreserveFn: func(context.Context) (repository.AllocationUnreservationTransaction, error) {
+		order = append(order, "begin")
+		return tx, nil
+	}}
+	if err := NewAllocationService(repo).UnreserveAllocation(context.Background(), 100); err != nil {
+		t.Fatalf("UnreserveAllocation() error = %v", err)
+	}
+	if got, want := strings.Join(order, ","), "begin,lock,delete,commit"; got != want {
+		t.Fatalf("operation order = %q, want %q", got, want)
+	}
+}
+
+func TestAllocationService_UnreserveAllocationRejectsCurrentStateAndRollsBack(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		allocation *domain.Allocation
+		lockErr    error
+		wantErr    error
+	}{
+		{name: "missing", lockErr: domain.ErrIPAllocationNotFound, wantErr: domain.ErrIPAllocationNotFound},
+		{name: "assigned", allocation: &domain.Allocation{ID: 100, Status: domain.AllocationStatusAssigned}, wantErr: domain.ErrIPNotAssignable},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			deleted := false
+			rolledBack := false
+			tx := &mockUnreservationTransaction{
+				lockFn: func(context.Context, int64) (*domain.Allocation, error) { return tc.allocation, tc.lockErr },
+				deleteFn: func(context.Context, int64) error {
+					deleted = true
+					return nil
+				},
+				commitFn: func() error { return nil },
+				rollbackFn: func() error {
+					rolledBack = true
+					return nil
+				},
+			}
+			repo := &mockAllocationRepo{beginUnreserveFn: func(context.Context) (repository.AllocationUnreservationTransaction, error) {
+				return tx, nil
+			}}
+			err := NewAllocationService(repo).UnreserveAllocation(context.Background(), 100)
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("error = %v, want %v", err, tc.wantErr)
+			}
+			if deleted || !rolledBack {
+				t.Fatalf("deleted=%v rolledBack=%v", deleted, rolledBack)
+			}
+		})
+	}
+}
+
+func TestAllocationService_UnreserveAllocationInvalidIDDoesNotBegin(t *testing.T) {
+	beginCalls := 0
+	repo := &mockAllocationRepo{beginUnreserveFn: func(context.Context) (repository.AllocationUnreservationTransaction, error) {
+		beginCalls++
+		return nil, errors.New("must not begin")
+	}}
+	for _, allocationID := range []int64{0, -1} {
+		if err := NewAllocationService(repo).UnreserveAllocation(context.Background(), allocationID); !errors.Is(err, domain.ErrInvalidRequest) {
+			t.Fatalf("ID %d error = %v, want ErrInvalidRequest", allocationID, err)
+		}
+	}
+	if beginCalls != 0 {
+		t.Fatalf("BeginUnreservation calls = %d, want 0", beginCalls)
+	}
+}
+
+func TestAllocationService_UnreserveAllocationFailuresRollBack(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		deleteErr error
+		commitErr error
+		wantOrder string
+	}{
+		{name: "delete", deleteErr: errors.New("delete failure"), wantOrder: "begin,lock,delete,rollback"},
+		{name: "commit", commitErr: errors.New("commit failure"), wantOrder: "begin,lock,delete,commit,rollback"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var order []string
+			tx := &mockUnreservationTransaction{
+				lockFn: func(_ context.Context, allocationID int64) (*domain.Allocation, error) {
+					order = append(order, "lock")
+					return &domain.Allocation{ID: allocationID, Status: domain.AllocationStatusReserved}, nil
+				},
+				deleteFn: func(context.Context, int64) error {
+					order = append(order, "delete")
+					return tc.deleteErr
+				},
+				commitFn: func() error {
+					order = append(order, "commit")
+					return tc.commitErr
+				},
+				rollbackFn: func() error {
+					order = append(order, "rollback")
+					return nil
+				},
+			}
+			repo := &mockAllocationRepo{beginUnreserveFn: func(context.Context) (repository.AllocationUnreservationTransaction, error) {
+				order = append(order, "begin")
+				return tx, nil
+			}}
+			if err := NewAllocationService(repo).UnreserveAllocation(context.Background(), 100); err == nil {
+				t.Fatal("UnreserveAllocation() error = nil")
+			}
+			if got := strings.Join(order, ","); got != tc.wantOrder {
+				t.Fatalf("operation order = %q, want %q", got, tc.wantOrder)
 			}
 		})
 	}

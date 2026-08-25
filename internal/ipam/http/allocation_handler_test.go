@@ -17,8 +17,9 @@ import (
 )
 
 type mockAllocationRepo struct {
-	listFn  func(context.Context, repository.AllocationListFilter) ([]*domain.Allocation, *int64, error)
-	beginFn func(context.Context) (repository.AllocationReservationTransaction, error)
+	listFn           func(context.Context, repository.AllocationListFilter) ([]*domain.Allocation, *int64, error)
+	beginFn          func(context.Context) (repository.AllocationReservationTransaction, error)
+	beginUnreserveFn func(context.Context) (repository.AllocationUnreservationTransaction, error)
 }
 
 func (m *mockAllocationRepo) List(ctx context.Context, filter repository.AllocationListFilter) ([]*domain.Allocation, *int64, error) {
@@ -33,6 +34,13 @@ func (m *mockAllocationRepo) BeginReservation(ctx context.Context) (repository.A
 		return m.beginFn(ctx)
 	}
 	return nil, errors.New("unexpected BeginReservation call")
+}
+
+func (m *mockAllocationRepo) BeginUnreservation(ctx context.Context) (repository.AllocationUnreservationTransaction, error) {
+	if m.beginUnreserveFn != nil {
+		return m.beginUnreserveFn(ctx)
+	}
+	return nil, errors.New("unexpected BeginUnreservation call")
 }
 
 type mockReservationTransaction struct {
@@ -55,6 +63,29 @@ func (m *mockReservationTransaction) Commit() error {
 }
 
 func (m *mockReservationTransaction) Rollback() error {
+	return m.rollbackFn()
+}
+
+type mockUnreservationTransaction struct {
+	lockFn     func(context.Context, int64) (*domain.Allocation, error)
+	deleteFn   func(context.Context, int64) error
+	commitFn   func() error
+	rollbackFn func() error
+}
+
+func (m *mockUnreservationTransaction) LockAllocation(ctx context.Context, allocationID int64) (*domain.Allocation, error) {
+	return m.lockFn(ctx, allocationID)
+}
+
+func (m *mockUnreservationTransaction) DeleteLockedAllocation(ctx context.Context, allocationID int64) error {
+	return m.deleteFn(ctx, allocationID)
+}
+
+func (m *mockUnreservationTransaction) Commit() error {
+	return m.commitFn()
+}
+
+func (m *mockUnreservationTransaction) Rollback() error {
 	return m.rollbackFn()
 }
 
@@ -301,6 +332,111 @@ func TestAllocationHandler_ReserveAllocationErrorMappingAndSanitization(t *testi
 			w := httptest.NewRecorder()
 			mux.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/api/v1/ip-allocations", strings.NewReader(`{"subnet_id":10,"address":"192.168.10.20"}`)))
 			if w.Code != tc.wantStatus || strings.Contains(w.Body.String(), "pq:") || strings.Contains(w.Body.String(), "constraint") {
+				t.Fatalf("status/body = %d/%s", w.Code, w.Body.String())
+			}
+			var response ipamhttp.ErrorResponse
+			if err := json.NewDecoder(w.Body).Decode(&response); err != nil || response.Error.Code != tc.wantCode {
+				t.Fatalf("response = %#v, decode error = %v", response, err)
+			}
+		})
+	}
+}
+
+func TestAllocationHandler_UnreserveAllocationReturnsEmptyNoContent(t *testing.T) {
+	deleted := false
+	tx := &mockUnreservationTransaction{
+		lockFn: func(_ context.Context, allocationID int64) (*domain.Allocation, error) {
+			if allocationID != 100 {
+				t.Fatalf("allocation ID = %d, want 100", allocationID)
+			}
+			return &domain.Allocation{ID: allocationID, Status: domain.AllocationStatusReserved}, nil
+		},
+		deleteFn: func(_ context.Context, allocationID int64) error {
+			if allocationID != 100 {
+				t.Fatalf("deleted allocation ID = %d, want 100", allocationID)
+			}
+			deleted = true
+			return nil
+		},
+		commitFn:   func() error { return nil },
+		rollbackFn: func() error { return nil },
+	}
+	mux := setupAllocationTestServer(&mockAllocationRepo{beginUnreserveFn: func(context.Context) (repository.AllocationUnreservationTransaction, error) {
+		return tx, nil
+	}})
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, httptest.NewRequest(http.MethodDelete, "/api/v1/ip-allocations/100", nil))
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, body = %q", w.Code, w.Body.String())
+	}
+	if w.Body.Len() != 0 {
+		t.Fatalf("204 body length = %d, body = %q", w.Body.Len(), w.Body.String())
+	}
+	if !deleted {
+		t.Fatal("reserved allocation was not deleted")
+	}
+}
+
+func TestAllocationHandler_UnreserveAllocationInvalidIDsDoNotBeginTransaction(t *testing.T) {
+	beginCalls := 0
+	mux := setupAllocationTestServer(&mockAllocationRepo{beginUnreserveFn: func(context.Context) (repository.AllocationUnreservationTransaction, error) {
+		beginCalls++
+		return nil, errors.New("must not begin")
+	}})
+	for _, path := range []string{
+		"/api/v1/ip-allocations/nope",
+		"/api/v1/ip-allocations/0",
+		"/api/v1/ip-allocations/-1",
+	} {
+		t.Run(path, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			mux.ServeHTTP(w, httptest.NewRequest(http.MethodDelete, path, nil))
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+			}
+			var response ipamhttp.ErrorResponse
+			if err := json.NewDecoder(w.Body).Decode(&response); err != nil || response.Error.Code != "INVALID_REQUEST" {
+				t.Fatalf("response = %#v, decode error = %v", response, err)
+			}
+		})
+	}
+	if beginCalls != 0 {
+		t.Fatalf("BeginUnreservation calls = %d, want 0", beginCalls)
+	}
+}
+
+func TestAllocationHandler_UnreserveAllocationErrorMappingAndSanitization(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		allocation *domain.Allocation
+		lockErr    error
+		beginErr   error
+		wantStatus int
+		wantCode   string
+	}{
+		{name: "missing", lockErr: domain.ErrIPAllocationNotFound, wantStatus: http.StatusNotFound, wantCode: "IP_ALLOCATION_NOT_FOUND"},
+		{name: "assigned", allocation: &domain.Allocation{ID: 100, Status: domain.AllocationStatusAssigned}, wantStatus: http.StatusConflict, wantCode: "IP_NOT_ASSIGNABLE"},
+		{name: "unexpected", beginErr: errors.New("pq: secret SQL table ip_allocations failure"), wantStatus: http.StatusInternalServerError, wantCode: "INTERNAL_ERROR"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tx := &mockUnreservationTransaction{
+				lockFn: func(context.Context, int64) (*domain.Allocation, error) { return tc.allocation, tc.lockErr },
+				deleteFn: func(context.Context, int64) error {
+					t.Fatal("unexpected delete")
+					return nil
+				},
+				commitFn:   func() error { return nil },
+				rollbackFn: func() error { return nil },
+			}
+			mux := setupAllocationTestServer(&mockAllocationRepo{beginUnreserveFn: func(context.Context) (repository.AllocationUnreservationTransaction, error) {
+				if tc.beginErr != nil {
+					return nil, tc.beginErr
+				}
+				return tx, nil
+			}})
+			w := httptest.NewRecorder()
+			mux.ServeHTTP(w, httptest.NewRequest(http.MethodDelete, "/api/v1/ip-allocations/100", nil))
+			if w.Code != tc.wantStatus || strings.Contains(w.Body.String(), "pq:") || strings.Contains(w.Body.String(), "ip_allocations") {
 				t.Fatalf("status/body = %d/%s", w.Code, w.Body.String())
 			}
 			var response ipamhttp.ErrorResponse

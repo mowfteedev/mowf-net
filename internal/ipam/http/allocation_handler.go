@@ -27,6 +27,7 @@ func NewAllocationHandler(service *service.AllocationService) *AllocationHandler
 func (h *AllocationHandler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/ip-allocations", h.ListAllocations)
 	mux.HandleFunc("POST /api/v1/ip-allocations", h.ReserveAllocation)
+	mux.HandleFunc("DELETE /api/v1/ip-allocations/{allocation_id}", h.UnreserveAllocation)
 }
 
 // ReserveAllocation handles POST /api/v1/ip-allocations.
@@ -43,6 +44,21 @@ func (h *AllocationHandler) ReserveAllocation(w http.ResponseWriter, r *http.Req
 		return
 	}
 	writeJSON(w, http.StatusCreated, DataResponse{Data: allocation})
+}
+
+// UnreserveAllocation handles DELETE /api/v1/ip-allocations/{allocation_id}.
+func (h *AllocationHandler) UnreserveAllocation(w http.ResponseWriter, r *http.Request) {
+	allocationID, ok := parsePositivePathID(r.PathValue("allocation_id"))
+	if !ok {
+		writeError(w, http.StatusBadRequest, "INVALID_REQUEST", "Invalid allocation ID")
+		return
+	}
+
+	if err := h.service.UnreserveAllocation(r.Context(), allocationID); err != nil {
+		writeUnreserveAllocationError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // ListAllocations handles GET /api/v1/ip-allocations.
@@ -185,6 +201,19 @@ func writeReserveAllocationError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusConflict, "IP_NOT_ASSIGNABLE", "The IP address is not an assignable host.")
 	case errors.Is(err, domain.ErrIPAlreadyAllocated):
 		writeError(w, http.StatusConflict, "IP_ALREADY_ALLOCATED", "The IP address is already allocated.")
+	default:
+		writeError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "An internal server error occurred.")
+	}
+}
+
+func writeUnreserveAllocationError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, domain.ErrInvalidRequest):
+		writeError(w, http.StatusBadRequest, "INVALID_REQUEST", "Invalid allocation ID")
+	case errors.Is(err, domain.ErrIPAllocationNotFound):
+		writeError(w, http.StatusNotFound, "IP_ALLOCATION_NOT_FOUND", "The requested IP allocation was not found.")
+	case errors.Is(err, domain.ErrIPNotAssignable):
+		writeError(w, http.StatusConflict, "IP_NOT_ASSIGNABLE", "The IP allocation cannot be unreserved.")
 	default:
 		writeError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "An internal server error occurred.")
 	}

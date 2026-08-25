@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"fmt"
 	"net/netip"
 
 	"github.com/mowfteedev/mowf-net/internal/ipam/domain"
@@ -91,6 +92,48 @@ func (s *AllocationService) ReserveAllocation(ctx context.Context, req ReserveAl
 	}
 	committed = true
 	return allocationToDTO(allocation), nil
+}
+
+// UnreserveAllocation transitions one persisted reserved allocation back to
+// derived availability by deleting it in the same transaction that locks and
+// validates its current state.
+func (s *AllocationService) UnreserveAllocation(ctx context.Context, allocationID int64) error {
+	if allocationID <= 0 {
+		return domain.ErrInvalidRequest
+	}
+
+	tx, err := s.repo.BeginUnreservation(ctx)
+	if err != nil {
+		return err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	allocation, err := tx.LockAllocation(ctx, allocationID)
+	if err != nil {
+		return err
+	}
+	switch allocation.Status {
+	case domain.AllocationStatusAssigned:
+		return domain.ErrIPNotAssignable
+	case domain.AllocationStatusReserved:
+		// Continue with the only state transition authorized by M2-D.
+	default:
+		return fmt.Errorf("unexpected locked allocation status %q", allocation.Status)
+	}
+
+	if err := tx.DeleteLockedAllocation(ctx, allocation.ID); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	committed = true
+	return nil
 }
 
 func NewAllocationService(repo repository.AllocationRepository) *AllocationService {

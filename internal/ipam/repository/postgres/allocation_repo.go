@@ -32,6 +32,16 @@ func (r *AllocationRepository) BeginReservation(ctx context.Context) (repository
 	return &allocationReservationTransaction{tx: tx}, nil
 }
 
+// BeginUnreservation starts the PostgreSQL transaction used by Unreserve.
+// The returned transaction locks only the target allocation row.
+func (r *AllocationRepository) BeginUnreservation(ctx context.Context) (repository.AllocationUnreservationTransaction, error) {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to begin allocation unreservation transaction: %w", err)
+	}
+	return &allocationUnreservationTransaction{tx: tx}, nil
+}
+
 type allocationReservationTransaction struct {
 	tx *sql.Tx
 }
@@ -86,6 +96,60 @@ func (t *allocationReservationTransaction) Commit() error {
 }
 
 func (t *allocationReservationTransaction) Rollback() error {
+	return t.tx.Rollback()
+}
+
+type allocationUnreservationTransaction struct {
+	tx *sql.Tx
+}
+
+// LockAllocation reads the current allocation state under a row-level lock.
+// Under PostgreSQL READ COMMITTED, a waiter rechecks the row after a competing
+// DELETE commits and observes it as missing.
+func (t *allocationUnreservationTransaction) LockAllocation(ctx context.Context, allocationID int64) (*domain.Allocation, error) {
+	allocation, err := scanAllocation(t.tx.QueryRowContext(ctx, `
+		SELECT id, subnet_id, host(address), status, interface_id, description, created_at, updated_at
+		FROM ip_allocations
+		WHERE id = $1
+		FOR UPDATE
+	`, allocationID).Scan)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, domain.ErrIPAllocationNotFound
+		}
+		return nil, fmt.Errorf("failed to lock IP allocation for unreservation: %w", err)
+	}
+	return allocation, nil
+}
+
+// DeleteLockedAllocation removes the allocation identity previously locked by
+// this transaction. Zero affected rows indicate an internal consistency error.
+func (t *allocationUnreservationTransaction) DeleteLockedAllocation(ctx context.Context, allocationID int64) error {
+	result, err := t.tx.ExecContext(ctx, `
+		DELETE FROM ip_allocations
+		WHERE id = $1
+	`, allocationID)
+	if err != nil {
+		return fmt.Errorf("failed to delete reserved IP allocation: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to verify reserved IP allocation deletion: %w", err)
+	}
+	if affected != 1 {
+		return fmt.Errorf("reserved IP allocation deletion affected %d rows, expected 1", affected)
+	}
+	return nil
+}
+
+func (t *allocationUnreservationTransaction) Commit() error {
+	if err := t.tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit allocation unreservation transaction: %w", err)
+	}
+	return nil
+}
+
+func (t *allocationUnreservationTransaction) Rollback() error {
 	return t.tx.Rollback()
 }
 

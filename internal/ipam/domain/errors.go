@@ -24,5 +24,6 @@ var (
 	ErrIPOutsideSubnet      = errors.New("IP_OUTSIDE_SUBNET")
 	ErrIPNotAssignable      = errors.New("IP_NOT_ASSIGNABLE")
 	ErrIPAlreadyAllocated   = errors.New("IP_ALREADY_ALLOCATED")
+	ErrIPAllocationNotFound = errors.New("IP_ALLOCATION_NOT_FOUND")
 	ErrInvalidRequest       = errors.New("INVALID_REQUEST")
 )

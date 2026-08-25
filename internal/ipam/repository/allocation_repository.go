@@ -27,8 +27,18 @@ type AllocationReservationTransaction interface {
 	Rollback() error
 }
 
+// AllocationUnreservationTransaction exposes only the operations needed to
+// serialize and remove one reserved allocation.
+type AllocationUnreservationTransaction interface {
+	LockAllocation(ctx context.Context, allocationID int64) (*domain.Allocation, error)
+	DeleteLockedAllocation(ctx context.Context, allocationID int64) error
+	Commit() error
+	Rollback() error
+}
+
 // AllocationRepository defines persisted IP allocation access.
 type AllocationRepository interface {
 	List(ctx context.Context, filter AllocationListFilter) ([]*domain.Allocation, *int64, error)
 	BeginReservation(ctx context.Context) (AllocationReservationTransaction, error)
+	BeginUnreservation(ctx context.Context) (AllocationUnreservationTransaction, error)
 }

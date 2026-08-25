@@ -21,5 +21,6 @@ var (
 	ErrSubnetResizeConflict = errors.New("SUBNET_RESIZE_CONFLICT")
 	ErrSubnetHasAllocations = errors.New("SUBNET_HAS_ALLOCATIONS")
 	ErrVlanNotFound         = errors.New("VLAN_NOT_FOUND")
+	ErrIPOutsideSubnet      = errors.New("IP_OUTSIDE_SUBNET")
 	ErrInvalidRequest       = errors.New("INVALID_REQUEST")
 )

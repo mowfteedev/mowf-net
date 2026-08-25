@@ -34,10 +34,13 @@ func New(cfg Config) (*App, error) {
 	allocationRepo := postgres.NewAllocationRepository(db)
 	allocationService := service.NewAllocationService(allocationRepo)
 	allocationHandler := ipamhttp.NewAllocationHandler(allocationService)
+	availableIPService := service.NewAvailableIPService(subnetRepo, allocationRepo)
+	availableIPHandler := ipamhttp.NewAvailableIPHandler(availableIPService)
 
 	mux := http.NewServeMux()
 	subnetHandler.RegisterRoutes(mux)
 	allocationHandler.RegisterRoutes(mux)
+	availableIPHandler.RegisterRoutes(mux)
 
 	server := &http.Server{
 		Addr:         cfg.HTTPAddr,

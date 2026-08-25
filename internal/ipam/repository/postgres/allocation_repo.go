@@ -3,10 +3,12 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net/netip"
 	"strings"
 
+	"github.com/lib/pq"
 	"github.com/mowfteedev/mowf-net/internal/ipam/domain"
 	"github.com/mowfteedev/mowf-net/internal/ipam/repository"
 )
@@ -18,6 +20,73 @@ type AllocationRepository struct {
 
 func NewAllocationRepository(db *sql.DB) *AllocationRepository {
 	return &AllocationRepository{db: db}
+}
+
+// BeginReservation starts the PostgreSQL transaction used by the Reserve
+// workflow. Locking and writes remain encapsulated by the returned object.
+func (r *AllocationRepository) BeginReservation(ctx context.Context) (repository.AllocationReservationTransaction, error) {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to begin allocation reservation transaction: %w", err)
+	}
+	return &allocationReservationTransaction{tx: tx}, nil
+}
+
+type allocationReservationTransaction struct {
+	tx *sql.Tx
+}
+
+// LockSubnet obtains the lock mode required for Reserve. FOR KEY SHARE
+// conflicts with M1 Resize/Delete FOR UPDATE locks while allowing independent
+// reservations on the same Subnet to proceed concurrently.
+func (t *allocationReservationTransaction) LockSubnet(ctx context.Context, subnetID int64) (domain.CIDR, error) {
+	var network string
+	var prefixLength int
+	err := t.tx.QueryRowContext(ctx, `
+		SELECT host(network), prefix_length
+		FROM subnets
+		WHERE id = $1
+		FOR KEY SHARE
+	`, subnetID).Scan(&network, &prefixLength)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return domain.CIDR{}, domain.ErrSubnetNotFound
+		}
+		return domain.CIDR{}, fmt.Errorf("failed to lock subnet for allocation reservation: %w", err)
+	}
+
+	cidr, err := domain.NewCIDRFromParts(network, prefixLength)
+	if err != nil {
+		return domain.CIDR{}, fmt.Errorf("corrupted locked subnet record: %w", err)
+	}
+	return cidr, nil
+}
+
+// InsertReserved persists and returns the actual reserved allocation. The
+// status and NULL interface are fixed by this operation rather than supplied
+// by callers.
+func (t *allocationReservationTransaction) InsertReserved(ctx context.Context, allocation *domain.Allocation) error {
+	inserted, err := scanAllocation(t.tx.QueryRowContext(ctx, `
+		INSERT INTO ip_allocations (subnet_id, address, status, interface_id, description)
+		VALUES ($1, $2::inet, 'reserved', NULL, $3)
+		RETURNING id, subnet_id, host(address), status, interface_id, description, created_at, updated_at
+	`, allocation.SubnetID, allocation.Address.String(), allocation.Description).Scan)
+	if err != nil {
+		return classifyAllocationInsertError(err)
+	}
+	*allocation = *inserted
+	return nil
+}
+
+func (t *allocationReservationTransaction) Commit() error {
+	if err := t.tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit allocation reservation transaction: %w", err)
+	}
+	return nil
+}
+
+func (t *allocationReservationTransaction) Rollback() error {
+	return t.tx.Rollback()
 }
 
 // ListOccupiedAddresses returns all persisted reserved or assigned addresses
@@ -163,4 +232,15 @@ func scanAllocation(scan allocationScanner) (*domain.Allocation, error) {
 		allocation.InterfaceID = &interfaceID.Int64
 	}
 	return &allocation, nil
+}
+
+// classifyAllocationInsertError deliberately requires both the duplicate
+// SQLSTATE and the exact global-address constraint. Other database failures
+// remain internal errors.
+func classifyAllocationInsertError(err error) error {
+	var pqErr *pq.Error
+	if errors.As(err, &pqErr) && pqErr.Code == "23505" && pqErr.Constraint == "ip_allocations_address_uq" {
+		return domain.ErrIPAlreadyAllocated
+	}
+	return fmt.Errorf("failed to insert reserved allocation: %w", err)
 }

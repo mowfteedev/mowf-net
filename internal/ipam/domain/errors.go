@@ -22,5 +22,7 @@ var (
 	ErrSubnetHasAllocations = errors.New("SUBNET_HAS_ALLOCATIONS")
 	ErrVlanNotFound         = errors.New("VLAN_NOT_FOUND")
 	ErrIPOutsideSubnet      = errors.New("IP_OUTSIDE_SUBNET")
+	ErrIPNotAssignable      = errors.New("IP_NOT_ASSIGNABLE")
+	ErrIPAlreadyAllocated   = errors.New("IP_ALREADY_ALLOCATED")
 	ErrInvalidRequest       = errors.New("INVALID_REQUEST")
 )

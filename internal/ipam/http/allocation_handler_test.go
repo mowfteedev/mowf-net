@@ -17,7 +17,8 @@ import (
 )
 
 type mockAllocationRepo struct {
-	listFn func(context.Context, repository.AllocationListFilter) ([]*domain.Allocation, *int64, error)
+	listFn  func(context.Context, repository.AllocationListFilter) ([]*domain.Allocation, *int64, error)
+	beginFn func(context.Context) (repository.AllocationReservationTransaction, error)
 }
 
 func (m *mockAllocationRepo) List(ctx context.Context, filter repository.AllocationListFilter) ([]*domain.Allocation, *int64, error) {
@@ -25,6 +26,45 @@ func (m *mockAllocationRepo) List(ctx context.Context, filter repository.Allocat
 		return m.listFn(ctx, filter)
 	}
 	return nil, nil, nil
+}
+
+func (m *mockAllocationRepo) BeginReservation(ctx context.Context) (repository.AllocationReservationTransaction, error) {
+	if m.beginFn != nil {
+		return m.beginFn(ctx)
+	}
+	return nil, errors.New("unexpected BeginReservation call")
+}
+
+type mockReservationTransaction struct {
+	lockFn     func(context.Context, int64) (domain.CIDR, error)
+	insertFn   func(context.Context, *domain.Allocation) error
+	commitFn   func() error
+	rollbackFn func() error
+}
+
+func (m *mockReservationTransaction) LockSubnet(ctx context.Context, subnetID int64) (domain.CIDR, error) {
+	return m.lockFn(ctx, subnetID)
+}
+
+func (m *mockReservationTransaction) InsertReserved(ctx context.Context, allocation *domain.Allocation) error {
+	return m.insertFn(ctx, allocation)
+}
+
+func (m *mockReservationTransaction) Commit() error {
+	return m.commitFn()
+}
+
+func (m *mockReservationTransaction) Rollback() error {
+	return m.rollbackFn()
+}
+
+func mustHTTPTestCIDR(t *testing.T, raw string) domain.CIDR {
+	t.Helper()
+	cidr, err := domain.ParseCIDR(raw)
+	if err != nil {
+		t.Fatalf("ParseCIDR(%q): %v", raw, err)
+	}
+	return cidr
 }
 
 func setupAllocationTestServer(repo *mockAllocationRepo) *http.ServeMux {
@@ -139,5 +179,134 @@ func TestAllocationHandler_ListAllocations_RepositoryErrorIsSanitized(t *testing
 	var response ipamhttp.ErrorResponse
 	if err := json.NewDecoder(w.Body).Decode(&response); err != nil || response.Error.Code != "INTERNAL_ERROR" {
 		t.Fatalf("error response = %#v, decode error = %v", response, err)
+	}
+}
+
+func TestAllocationHandler_ReserveAllocationCreatedAndDescriptionDefaults(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		body            string
+		wantDescription string
+	}{
+		{name: "preserved", body: `{"subnet_id":10,"address":"192.168.10.20","description":" Printer reservation "}`, wantDescription: " Printer reservation "},
+		{name: "omitted defaults empty", body: `{"subnet_id":10,"address":"192.168.10.21"}`, wantDescription: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cidr := mustHTTPTestCIDR(t, "192.168.10.0/24")
+			tx := &mockReservationTransaction{
+				lockFn: func(_ context.Context, subnetID int64) (domain.CIDR, error) {
+					if subnetID != 10 {
+						t.Fatalf("subnet ID = %d", subnetID)
+					}
+					return cidr, nil
+				},
+				insertFn: func(_ context.Context, allocation *domain.Allocation) error {
+					if allocation.Description != tc.wantDescription {
+						t.Fatalf("description = %q, want %q", allocation.Description, tc.wantDescription)
+					}
+					allocation.ID = 100
+					return nil
+				},
+				commitFn:   func() error { return nil },
+				rollbackFn: func() error { return nil },
+			}
+			mux := setupAllocationTestServer(&mockAllocationRepo{beginFn: func(context.Context) (repository.AllocationReservationTransaction, error) {
+				return tx, nil
+			}})
+			w := httptest.NewRecorder()
+			mux.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/api/v1/ip-allocations", strings.NewReader(tc.body)))
+			if w.Code != http.StatusCreated {
+				t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+			}
+			var response struct {
+				Data service.AllocationDTO `json:"data"`
+			}
+			if err := json.NewDecoder(w.Body).Decode(&response); err != nil {
+				t.Fatal(err)
+			}
+			if response.Data.ID != 100 || response.Data.SubnetID != 10 || response.Data.Status != "reserved" || response.Data.InterfaceID != nil || response.Data.Description != tc.wantDescription {
+				t.Fatalf("response data = %#v", response.Data)
+			}
+		})
+	}
+}
+
+func TestAllocationHandler_ReserveAllocationStrictInvalidPayloadDoesNotBeginTransaction(t *testing.T) {
+	beginCalls := 0
+	mux := setupAllocationTestServer(&mockAllocationRepo{beginFn: func(context.Context) (repository.AllocationReservationTransaction, error) {
+		beginCalls++
+		return nil, errors.New("must not begin")
+	}})
+	invalidBodies := map[string]string{
+		"empty":                 "",
+		"null object":           "null",
+		"empty object":          `{}`,
+		"missing subnet":        `{"address":"192.168.10.20"}`,
+		"missing address":       `{"subnet_id":10}`,
+		"zero subnet":           `{"subnet_id":0,"address":"192.168.10.20"}`,
+		"negative subnet":       `{"subnet_id":-1,"address":"192.168.10.20"}`,
+		"subnet wrong type":     `{"subnet_id":"10","address":"192.168.10.20"}`,
+		"address wrong type":    `{"subnet_id":10,"address":20}`,
+		"description number":    `{"subnet_id":10,"address":"192.168.10.20","description":1}`,
+		"description null":      `{"subnet_id":10,"address":"192.168.10.20","description":null}`,
+		"malformed address":     `{"subnet_id":10,"address":"not-an-ip"}`,
+		"IPv6":                  `{"subnet_id":10,"address":"2001:db8::1"}`,
+		"unknown status":        `{"subnet_id":10,"address":"192.168.10.20","status":"reserved"}`,
+		"unknown interface":     `{"subnet_id":10,"address":"192.168.10.20","interface_id":null}`,
+		"malformed JSON":        `{"subnet_id":10,`,
+		"second JSON value":     `{"subnet_id":10,"address":"192.168.10.20"} {}`,
+		"trailing JSON content": `{"subnet_id":10,"address":"192.168.10.20"} true`,
+	}
+	for name, body := range invalidBodies {
+		t.Run(name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			mux.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/api/v1/ip-allocations", strings.NewReader(body)))
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+			}
+			var response ipamhttp.ErrorResponse
+			if err := json.NewDecoder(w.Body).Decode(&response); err != nil || response.Error.Code != "INVALID_REQUEST" {
+				t.Fatalf("response = %#v, decode error = %v", response, err)
+			}
+		})
+	}
+	if beginCalls != 0 {
+		t.Fatalf("BeginReservation calls = %d, want 0", beginCalls)
+	}
+}
+
+func TestAllocationHandler_ReserveAllocationErrorMappingAndSanitization(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		err        error
+		wantStatus int
+		wantCode   string
+	}{
+		{name: "subnet missing", err: domain.ErrSubnetNotFound, wantStatus: http.StatusNotFound, wantCode: "SUBNET_NOT_FOUND"},
+		{name: "outside subnet", err: domain.ErrIPOutsideSubnet, wantStatus: http.StatusBadRequest, wantCode: "IP_OUTSIDE_SUBNET"},
+		{name: "not assignable", err: domain.ErrIPNotAssignable, wantStatus: http.StatusConflict, wantCode: "IP_NOT_ASSIGNABLE"},
+		{name: "duplicate", err: domain.ErrIPAlreadyAllocated, wantStatus: http.StatusConflict, wantCode: "IP_ALREADY_ALLOCATED"},
+		{name: "unexpected", err: errors.New("pq: secret SQL constraint failure"), wantStatus: http.StatusInternalServerError, wantCode: "INTERNAL_ERROR"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tx := &mockReservationTransaction{
+				lockFn:     func(context.Context, int64) (domain.CIDR, error) { return domain.CIDR{}, tc.err },
+				insertFn:   func(context.Context, *domain.Allocation) error { return nil },
+				commitFn:   func() error { return nil },
+				rollbackFn: func() error { return nil },
+			}
+			mux := setupAllocationTestServer(&mockAllocationRepo{beginFn: func(context.Context) (repository.AllocationReservationTransaction, error) {
+				return tx, nil
+			}})
+			w := httptest.NewRecorder()
+			mux.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/api/v1/ip-allocations", strings.NewReader(`{"subnet_id":10,"address":"192.168.10.20"}`)))
+			if w.Code != tc.wantStatus || strings.Contains(w.Body.String(), "pq:") || strings.Contains(w.Body.String(), "constraint") {
+				t.Fatalf("status/body = %d/%s", w.Code, w.Body.String())
+			}
+			var response ipamhttp.ErrorResponse
+			if err := json.NewDecoder(w.Body).Decode(&response); err != nil || response.Error.Code != tc.wantCode {
+				t.Fatalf("response = %#v, decode error = %v", response, err)
+			}
+		})
 	}
 }

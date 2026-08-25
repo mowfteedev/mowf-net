@@ -34,9 +34,63 @@ type ListAllocationsResponse struct {
 	Page PageInfo         `json:"page"`
 }
 
-// AllocationService provides allocation read operations.
+// ReserveAllocationRequest contains the validated input for a reservation.
+type ReserveAllocationRequest struct {
+	SubnetID    int64
+	Address     netip.Addr
+	Description string
+}
+
+// AllocationService provides persisted allocation operations.
 type AllocationService struct {
 	repo repository.AllocationRepository
+}
+
+// ReserveAllocation transitions one derived available address to a persisted
+// reserved allocation. Membership and usability are evaluated only after the
+// repository has locked and returned the current Subnet CIDR.
+func (s *AllocationService) ReserveAllocation(ctx context.Context, req ReserveAllocationRequest) (*AllocationDTO, error) {
+	if req.SubnetID <= 0 || !req.Address.IsValid() || !req.Address.Is4() {
+		return nil, domain.ErrInvalidRequest
+	}
+
+	tx, err := s.repo.BeginReservation(ctx)
+	if err != nil {
+		return nil, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	lockedCIDR, err := tx.LockSubnet(ctx, req.SubnetID)
+	if err != nil {
+		return nil, err
+	}
+	if !lockedCIDR.Contains(req.Address) {
+		return nil, domain.ErrIPOutsideSubnet
+	}
+	if !lockedCIDR.IsUsable(req.Address) {
+		return nil, domain.ErrIPNotAssignable
+	}
+
+	allocation := &domain.Allocation{
+		SubnetID:    req.SubnetID,
+		Address:     req.Address,
+		Status:      domain.AllocationStatusReserved,
+		InterfaceID: nil,
+		Description: req.Description,
+	}
+	if err := tx.InsertReserved(ctx, allocation); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	committed = true
+	return allocationToDTO(allocation), nil
 }
 
 func NewAllocationService(repo repository.AllocationRepository) *AllocationService {

@@ -4,14 +4,25 @@ import (
 	"context"
 	"errors"
 	"net/netip"
+	"strings"
 	"testing"
 
 	"github.com/mowfteedev/mowf-net/internal/ipam/domain"
 	"github.com/mowfteedev/mowf-net/internal/ipam/repository"
 )
 
+func mustAllocationTestCIDR(t *testing.T, raw string) domain.CIDR {
+	t.Helper()
+	cidr, err := domain.ParseCIDR(raw)
+	if err != nil {
+		t.Fatalf("ParseCIDR(%q): %v", raw, err)
+	}
+	return cidr
+}
+
 type mockAllocationRepo struct {
-	listFn func(context.Context, repository.AllocationListFilter) ([]*domain.Allocation, *int64, error)
+	listFn  func(context.Context, repository.AllocationListFilter) ([]*domain.Allocation, *int64, error)
+	beginFn func(context.Context) (repository.AllocationReservationTransaction, error)
 }
 
 func (m *mockAllocationRepo) List(ctx context.Context, filter repository.AllocationListFilter) ([]*domain.Allocation, *int64, error) {
@@ -19,6 +30,36 @@ func (m *mockAllocationRepo) List(ctx context.Context, filter repository.Allocat
 		return m.listFn(ctx, filter)
 	}
 	return nil, nil, nil
+}
+
+func (m *mockAllocationRepo) BeginReservation(ctx context.Context) (repository.AllocationReservationTransaction, error) {
+	if m.beginFn != nil {
+		return m.beginFn(ctx)
+	}
+	return nil, errors.New("unexpected BeginReservation call")
+}
+
+type mockReservationTransaction struct {
+	lockFn     func(context.Context, int64) (domain.CIDR, error)
+	insertFn   func(context.Context, *domain.Allocation) error
+	commitFn   func() error
+	rollbackFn func() error
+}
+
+func (m *mockReservationTransaction) LockSubnet(ctx context.Context, subnetID int64) (domain.CIDR, error) {
+	return m.lockFn(ctx, subnetID)
+}
+
+func (m *mockReservationTransaction) InsertReserved(ctx context.Context, allocation *domain.Allocation) error {
+	return m.insertFn(ctx, allocation)
+}
+
+func (m *mockReservationTransaction) Commit() error {
+	return m.commitFn()
+}
+
+func (m *mockReservationTransaction) Rollback() error {
+	return m.rollbackFn()
 }
 
 func TestAllocationService_ListAllocations(t *testing.T) {
@@ -73,5 +114,93 @@ func TestAllocationService_ListAllocations_DefaultAndInvalidLimits(t *testing.T)
 		if _, err := svc.ListAllocations(context.Background(), ListAllocationsRequest{Limit: limit}); !errors.Is(err, domain.ErrInvalidRequest) {
 			t.Errorf("limit %d error = %v, want ErrInvalidRequest", limit, err)
 		}
+	}
+}
+
+func TestAllocationService_ReserveAllocationUsesLockedCIDRAndCommitsInsertedRow(t *testing.T) {
+	lockedCIDR := mustAllocationTestCIDR(t, "192.168.10.0/24")
+	address := netip.MustParseAddr("192.168.10.20")
+	var order []string
+	tx := &mockReservationTransaction{
+		lockFn: func(_ context.Context, subnetID int64) (domain.CIDR, error) {
+			order = append(order, "lock")
+			if subnetID != 10 {
+				t.Fatalf("locked subnet ID = %d, want 10", subnetID)
+			}
+			return lockedCIDR, nil
+		},
+		insertFn: func(_ context.Context, allocation *domain.Allocation) error {
+			order = append(order, "insert")
+			if allocation.SubnetID != 10 || allocation.Address != address || allocation.Status != domain.AllocationStatusReserved || allocation.InterfaceID != nil || allocation.Description != "Printer reservation" {
+				t.Fatalf("unexpected allocation before insert: %#v", allocation)
+			}
+			allocation.ID = 100
+			return nil
+		},
+		commitFn: func() error {
+			order = append(order, "commit")
+			return nil
+		},
+		rollbackFn: func() error {
+			order = append(order, "rollback")
+			return nil
+		},
+	}
+	repo := &mockAllocationRepo{beginFn: func(context.Context) (repository.AllocationReservationTransaction, error) {
+		order = append(order, "begin")
+		return tx, nil
+	}}
+
+	dto, err := NewAllocationService(repo).ReserveAllocation(context.Background(), ReserveAllocationRequest{
+		SubnetID: 10, Address: address, Description: "Printer reservation",
+	})
+	if err != nil {
+		t.Fatalf("ReserveAllocation() error = %v", err)
+	}
+	if got, want := strings.Join(order, ","), "begin,lock,insert,commit"; got != want {
+		t.Fatalf("operation order = %q, want %q", got, want)
+	}
+	if dto.ID != 100 || dto.Status != "reserved" || dto.InterfaceID != nil || dto.Description != "Printer reservation" {
+		t.Fatalf("unexpected DTO: %#v", dto)
+	}
+}
+
+func TestAllocationService_ReserveAllocationValidatesAgainstLockedCIDRAndRollsBack(t *testing.T) {
+	lockedCIDR := mustAllocationTestCIDR(t, "192.168.20.0/24")
+	for _, tc := range []struct {
+		name    string
+		address string
+		wantErr error
+	}{
+		{name: "outside", address: "192.168.10.20", wantErr: domain.ErrIPOutsideSubnet},
+		{name: "network", address: "192.168.20.0", wantErr: domain.ErrIPNotAssignable},
+		{name: "broadcast", address: "192.168.20.255", wantErr: domain.ErrIPNotAssignable},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			inserted := false
+			rolledBack := false
+			tx := &mockReservationTransaction{
+				lockFn: func(context.Context, int64) (domain.CIDR, error) { return lockedCIDR, nil },
+				insertFn: func(context.Context, *domain.Allocation) error {
+					inserted = true
+					return nil
+				},
+				commitFn: func() error { return nil },
+				rollbackFn: func() error {
+					rolledBack = true
+					return nil
+				},
+			}
+			repo := &mockAllocationRepo{beginFn: func(context.Context) (repository.AllocationReservationTransaction, error) { return tx, nil }}
+			_, err := NewAllocationService(repo).ReserveAllocation(context.Background(), ReserveAllocationRequest{
+				SubnetID: 10, Address: netip.MustParseAddr(tc.address),
+			})
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("error = %v, want %v", err, tc.wantErr)
+			}
+			if inserted || !rolledBack {
+				t.Fatalf("inserted=%v rolledBack=%v", inserted, rolledBack)
+			}
+		})
 	}
 }

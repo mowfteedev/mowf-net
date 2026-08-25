@@ -18,7 +18,17 @@ type AllocationListFilter struct {
 	Cursor      *int64
 }
 
-// AllocationRepository defines read access for persisted IP allocations.
+// AllocationReservationTransaction exposes only the operations needed to
+// reserve an address while the current Subnet row remains locked.
+type AllocationReservationTransaction interface {
+	LockSubnet(ctx context.Context, subnetID int64) (domain.CIDR, error)
+	InsertReserved(ctx context.Context, allocation *domain.Allocation) error
+	Commit() error
+	Rollback() error
+}
+
+// AllocationRepository defines persisted IP allocation access.
 type AllocationRepository interface {
 	List(ctx context.Context, filter AllocationListFilter) ([]*domain.Allocation, *int64, error)
+	BeginReservation(ctx context.Context) (AllocationReservationTransaction, error)
 }

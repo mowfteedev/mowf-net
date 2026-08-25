@@ -1,7 +1,10 @@
 package http
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/netip"
 	"strconv"
@@ -23,6 +26,23 @@ func NewAllocationHandler(service *service.AllocationService) *AllocationHandler
 // RegisterRoutes registers allocation endpoints on the existing application mux.
 func (h *AllocationHandler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/ip-allocations", h.ListAllocations)
+	mux.HandleFunc("POST /api/v1/ip-allocations", h.ReserveAllocation)
+}
+
+// ReserveAllocation handles POST /api/v1/ip-allocations.
+func (h *AllocationHandler) ReserveAllocation(w http.ResponseWriter, r *http.Request) {
+	req, err := decodeReserveAllocationRequest(r.Body)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "INVALID_REQUEST", "Invalid request payload")
+		return
+	}
+
+	allocation, err := h.service.ReserveAllocation(r.Context(), req)
+	if err != nil {
+		writeReserveAllocationError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, DataResponse{Data: allocation})
 }
 
 // ListAllocations handles GET /api/v1/ip-allocations.
@@ -109,4 +129,63 @@ func parsePositiveQueryID(value string) (int64, error) {
 		return 0, domain.ErrInvalidRequest
 	}
 	return id, nil
+}
+
+func decodeReserveAllocationRequest(body io.Reader) (service.ReserveAllocationRequest, error) {
+	var fields map[string]json.RawMessage
+	decoder := json.NewDecoder(body)
+	if err := decoder.Decode(&fields); err != nil {
+		return service.ReserveAllocationRequest{}, domain.ErrInvalidRequest
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return service.ReserveAllocationRequest{}, domain.ErrInvalidRequest
+	}
+
+	var req service.ReserveAllocationRequest
+	subnetRaw, ok := fields["subnet_id"]
+	if !ok || bytes.Equal(bytes.TrimSpace(subnetRaw), []byte("null")) || json.Unmarshal(subnetRaw, &req.SubnetID) != nil || req.SubnetID <= 0 {
+		return service.ReserveAllocationRequest{}, domain.ErrInvalidRequest
+	}
+	addressRaw, ok := fields["address"]
+	if !ok || bytes.Equal(bytes.TrimSpace(addressRaw), []byte("null")) {
+		return service.ReserveAllocationRequest{}, domain.ErrInvalidRequest
+	}
+	var address string
+	if err := json.Unmarshal(addressRaw, &address); err != nil {
+		return service.ReserveAllocationRequest{}, domain.ErrInvalidRequest
+	}
+	parsedAddress, err := netip.ParseAddr(address)
+	if err != nil || !parsedAddress.Is4() {
+		return service.ReserveAllocationRequest{}, domain.ErrInvalidRequest
+	}
+	req.Address = parsedAddress
+
+	if descriptionRaw, ok := fields["description"]; ok {
+		if bytes.Equal(bytes.TrimSpace(descriptionRaw), []byte("null")) || json.Unmarshal(descriptionRaw, &req.Description) != nil {
+			return service.ReserveAllocationRequest{}, domain.ErrInvalidRequest
+		}
+	}
+	for name := range fields {
+		if name != "subnet_id" && name != "address" && name != "description" {
+			return service.ReserveAllocationRequest{}, domain.ErrInvalidRequest
+		}
+	}
+	return req, nil
+}
+
+func writeReserveAllocationError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, domain.ErrInvalidRequest):
+		writeError(w, http.StatusBadRequest, "INVALID_REQUEST", "Invalid request payload")
+	case errors.Is(err, domain.ErrSubnetNotFound):
+		writeError(w, http.StatusNotFound, "SUBNET_NOT_FOUND", "The requested subnet was not found.")
+	case errors.Is(err, domain.ErrIPOutsideSubnet):
+		writeError(w, http.StatusBadRequest, "IP_OUTSIDE_SUBNET", "The IP address is outside the target subnet.")
+	case errors.Is(err, domain.ErrIPNotAssignable):
+		writeError(w, http.StatusConflict, "IP_NOT_ASSIGNABLE", "The IP address is not an assignable host.")
+	case errors.Is(err, domain.ErrIPAlreadyAllocated):
+		writeError(w, http.StatusConflict, "IP_ALREADY_ALLOCATED", "The IP address is already allocated.")
+	default:
+		writeError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "An internal server error occurred.")
+	}
 }

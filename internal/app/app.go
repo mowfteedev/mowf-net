@@ -31,9 +31,13 @@ func New(cfg Config) (*App, error) {
 	subnetRepo := postgres.NewSubnetRepository(db)
 	subnetService := service.NewSubnetService(subnetRepo)
 	subnetHandler := ipamhttp.NewSubnetHandler(subnetService)
+	allocationRepo := postgres.NewAllocationRepository(db)
+	allocationService := service.NewAllocationService(allocationRepo)
+	allocationHandler := ipamhttp.NewAllocationHandler(allocationService)
 
 	mux := http.NewServeMux()
 	subnetHandler.RegisterRoutes(mux)
+	allocationHandler.RegisterRoutes(mux)
 
 	server := &http.Server{
 		Addr:         cfg.HTTPAddr,

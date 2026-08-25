@@ -117,6 +117,8 @@ Common HTTP statuses:
 Core error codes:
 
 ```text
+INVALID_REQUEST
+INTERNAL_ERROR
 INVALID_CIDR
 SUBNET_OVERLAP
 SUBNET_RESIZE_CONFLICT
@@ -126,6 +128,7 @@ IP_ALREADY_ALLOCATED
 IP_NOT_ASSIGNABLE
 INTERFACE_ALREADY_ASSIGNED
 VLAN_HAS_SUBNETS
+VLAN_NOT_FOUND
 DEVICE_NOT_FOUND
 INTERFACE_NOT_FOUND
 SUBNET_NOT_FOUND
@@ -144,6 +147,20 @@ General lists:
 ```text
 ?limit=50&cursor=<opaque>
 ```
+
+**Limit contract:**
+
+| Scenario | Behavior |
+|---|---|
+| `limit` omitted | default `50` applied |
+| `1 ≤ limit ≤ 100` | accepted exactly as requested |
+| `limit > 100` | `400 INVALID_REQUEST` |
+| `limit ≤ 0` | `400 INVALID_REQUEST` |
+| `limit` non-numeric | `400 INVALID_REQUEST` |
+
+Default: **50**. Maximum: **100**. Valid range: **1..100**.
+
+Out-of-range or malformed limit values are **never silently clamped** — they are always rejected with `400 INVALID_REQUEST` before any repository access.
 
 The implementation may internally use ID/keyset pagination. Client code treats `cursor` as opaque.
 
@@ -267,10 +284,12 @@ Rules:
 
 Success: `201 Created`.
 
-Conflicts:
+Failures:
 
-- `400 INVALID_CIDR`;
-- `409 SUBNET_OVERLAP`.
+- `400 INVALID_REQUEST` (malformed/unparseable request payload);
+- `400 INVALID_CIDR` (invalid or non-canonical CIDR);
+- `404 VLAN_NOT_FOUND` (referenced `vlan_ref_id` does not exist);
+- `409 SUBNET_OVERLAP` (overlaps with an existing subnet).
 
 ### GET `/subnets/{subnet_id}`
 
@@ -288,12 +307,32 @@ Allowed fields:
 }
 ```
 
-If CIDR changes, full overlap + allocation-safety validation is mandatory.
+PATCH fields are presence-aware:
 
-Conflicts:
+- an omitted field preserves its current value;
+- `cidr` must be a canonical IPv4 `/1..30` string; `null` is rejected;
+- `description` accepts any string, including `""`; `null` is rejected;
+- a positive integer `vlan_ref_id` sets the relationship;
+- `vlan_ref_id: null` unlinks the Subnet from its VLAN.
 
-- `409 SUBNET_OVERLAP`;
-- `409 SUBNET_RESIZE_CONFLICT`.
+An empty object, unknown fields, wrong field types, malformed JSON, trailing
+garbage, or a second JSON value is rejected with `400 INVALID_REQUEST`.
+When `cidr` is present, the request always enters the serialized Resize
+transaction and obtains the Subnet advisory lock followed by the target row
+lock, including when the supplied CIDR equals the current CIDR. The global
+overlap query and allocation usable-range inspection run only when the
+candidate CIDR differs from the locked current CIDR.
+
+Success: `200 OK` using the single-resource envelope.
+
+Failures:
+
+- `400 INVALID_REQUEST` (invalid PATCH shape or field values);
+- `400 INVALID_CIDR` (invalid or non-canonical CIDR);
+- `404 SUBNET_NOT_FOUND` (target Subnet does not exist);
+- `404 VLAN_NOT_FOUND` (supplied positive `vlan_ref_id` does not exist);
+- `409 SUBNET_OVERLAP` (candidate CIDR overlaps another Subnet);
+- `409 SUBNET_RESIZE_CONFLICT` (an allocation would be outside the new usable host range).
 
 ### DELETE `/subnets/{subnet_id}`
 

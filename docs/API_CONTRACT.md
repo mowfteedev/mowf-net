@@ -316,9 +316,11 @@ PATCH fields are presence-aware:
 
 An empty object, unknown fields, wrong field types, malformed JSON, trailing
 garbage, or a second JSON value is rejected with `400 INVALID_REQUEST`.
-When `cidr` is present, full global overlap and allocation usable-range safety
-validation is mandatory, including when the supplied CIDR equals the current
-CIDR.
+When `cidr` is present, the request always enters the serialized Resize
+transaction and obtains the Subnet advisory lock followed by the target row
+lock, including when the supplied CIDR equals the current CIDR. The global
+overlap query and allocation usable-range inspection run only when the
+candidate CIDR differs from the locked current CIDR.
 
 Success: `200 OK` using the single-resource envelope.
 

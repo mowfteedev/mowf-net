@@ -22,10 +22,10 @@ type SubnetRead struct {
 	ReservedCount int64
 }
 
-// UpdateSubnet contains a presence-aware partial Subnet update. CIDR has already
-// passed domain validation, while merging is performed against the locked row.
+// UpdateSubnet contains a presence-aware partial Subnet update. CIDR remains
+// raw so the repository can validate it after acquiring the required locks.
 type UpdateSubnet struct {
-	CIDR           *domain.CIDR
+	CIDR           string
 	CIDRSet        bool
 	VlanRefID      *int64
 	VlanRefIDSet   bool

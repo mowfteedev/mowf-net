@@ -196,7 +196,11 @@ func (r *SubnetRepository) Update(ctx context.Context, id int64, patch repositor
 	}
 	candidate := current.Subnet
 	if patch.CIDRSet {
-		candidate.CIDR = *patch.CIDR
+		cidr, err := domain.ParseCIDR(patch.CIDR)
+		if err != nil {
+			return nil, err
+		}
+		candidate.CIDR = cidr
 	}
 	if patch.VlanRefIDSet {
 		candidate.VlanRefID = patch.VlanRefID

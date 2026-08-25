@@ -272,10 +272,14 @@ func TestSubnetService_UpdateAndDelete(t *testing.T) {
 		description := ""
 		vlanID := int64(5)
 		repo := &mockSubnetRepo{updateFn: func(ctx context.Context, id int64, patch repository.UpdateSubnet) (*repository.SubnetRead, error) {
-			if id != 9 || !patch.CIDRSet || patch.CIDR == nil || !patch.DescriptionSet || patch.Description != "" || !patch.VlanRefIDSet || patch.VlanRefID == nil || *patch.VlanRefID != 5 {
+			if id != 9 || !patch.CIDRSet || patch.CIDR != "192.168.50.0/24" || !patch.DescriptionSet || patch.Description != "" || !patch.VlanRefIDSet || patch.VlanRefID == nil || *patch.VlanRefID != 5 {
 				t.Fatalf("unexpected repository update: id=%d patch=%+v", id, patch)
 			}
-			return &repository.SubnetRead{Subnet: domain.Subnet{ID: id, CIDR: *patch.CIDR, Description: patch.Description, VlanRefID: patch.VlanRefID}}, nil
+			parsed, err := domain.ParseCIDR(patch.CIDR)
+			if err != nil {
+				t.Fatalf("mock received invalid CIDR: %v", err)
+			}
+			return &repository.SubnetRead{Subnet: domain.Subnet{ID: id, CIDR: parsed, Description: patch.Description, VlanRefID: patch.VlanRefID}}, nil
 		}}
 		svc := NewSubnetService(repo)
 		cidrString := cidr.CIDR()

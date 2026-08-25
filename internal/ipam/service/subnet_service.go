@@ -188,8 +188,8 @@ func (s *SubnetService) ListSubnets(ctx context.Context, req ListSubnetsRequest)
 	}, nil
 }
 
-// UpdateSubnet validates supplied values and delegates the locked merge and
-// transaction ordering to the repository.
+// UpdateSubnet validates request presence/null semantics and delegates raw CIDR
+// validation, the locked merge, and transaction ordering to the repository.
 func (s *SubnetService) UpdateSubnet(ctx context.Context, id int64, req UpdateSubnetRequest) (*SubnetDTO, error) {
 	if id <= 0 || (!req.CIDRSet && !req.VlanRefIDSet && !req.DescriptionSet) {
 		return nil, domain.ErrInvalidRequest
@@ -205,11 +205,7 @@ func (s *SubnetService) UpdateSubnet(ctx context.Context, id int64, req UpdateSu
 		if req.CIDR == nil {
 			return nil, domain.ErrInvalidRequest
 		}
-		cidr, err := domain.ParseCIDR(*req.CIDR)
-		if err != nil {
-			return nil, err
-		}
-		patch.CIDR = &cidr
+		patch.CIDR = *req.CIDR
 	}
 	if req.DescriptionSet {
 		if req.Description == nil {

@@ -730,7 +730,7 @@ func TestSubnetHandler_Patch(t *testing.T) {
 			check func(t *testing.T, patch repository.UpdateSubnet)
 		}{
 			{"CIDR only", `{"cidr":"192.168.10.0/25"}`, func(t *testing.T, p repository.UpdateSubnet) {
-				if !p.CIDRSet || p.CIDR == nil || p.CIDR.CIDR() != "192.168.10.0/25" || p.DescriptionSet || p.VlanRefIDSet {
+				if !p.CIDRSet || p.CIDR != "192.168.10.0/25" || p.DescriptionSet || p.VlanRefIDSet {
 					t.Fatalf("unexpected CIDR patch: %+v", p)
 				}
 			}},
@@ -770,7 +770,11 @@ func TestSubnetHandler_Patch(t *testing.T) {
 					tc.check(t, patch)
 					subnet := domain.Subnet{ID: id, CIDR: baseCIDR, Description: "old"}
 					if patch.CIDRSet {
-						subnet.CIDR = *patch.CIDR
+						cidr, err := domain.ParseCIDR(patch.CIDR)
+						if err != nil {
+							t.Fatalf("mock received invalid CIDR: %v", err)
+						}
+						subnet.CIDR = cidr
 					}
 					if patch.DescriptionSet {
 						subnet.Description = patch.Description
@@ -849,7 +853,10 @@ func TestSubnetHandler_Patch(t *testing.T) {
 		called := false
 		repo := &mockSubnetRepo{updateFn: func(ctx context.Context, id int64, patch repository.UpdateSubnet) (*repository.SubnetRead, error) {
 			called = true
-			return nil, nil
+			if !patch.CIDRSet || patch.CIDR != "192.168.10.5/24" {
+				t.Fatalf("unexpected raw invalid CIDR patch: %+v", patch)
+			}
+			return nil, domain.ErrInvalidCIDR
 		}}
 		mux := setupTestServer(repo)
 		req := httptest.NewRequest(http.MethodPatch, "/api/v1/subnets/10", bytes.NewBufferString(`{"cidr":"192.168.10.5/24"}`))
@@ -858,8 +865,8 @@ func TestSubnetHandler_Patch(t *testing.T) {
 		if w.Code != http.StatusBadRequest || !bytes.Contains(w.Body.Bytes(), []byte(`"INVALID_CIDR"`)) {
 			t.Fatalf("unexpected invalid CIDR response: status=%d body=%s", w.Code, w.Body.String())
 		}
-		if called {
-			t.Fatal("repository called for invalid CIDR")
+		if !called {
+			t.Fatal("repository was not called for CIDR-present PATCH")
 		}
 	})
 

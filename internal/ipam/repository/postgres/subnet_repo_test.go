@@ -17,6 +17,7 @@ import (
 	"github.com/mowfteedev/mowf-net/internal/ipam/domain"
 	"github.com/mowfteedev/mowf-net/internal/ipam/repository"
 	"github.com/mowfteedev/mowf-net/internal/ipam/repository/postgres"
+	"github.com/mowfteedev/mowf-net/internal/ipam/service"
 )
 
 func acquireFreePort() (uint32, error) {
@@ -951,31 +952,41 @@ func TestSubnetRepo_ResizeBoundariesAndSafety(t *testing.T) {
 	}
 	resize := func(t *testing.T, id int64, cidrString string) error {
 		t.Helper()
-		cidr, err := domain.ParseCIDR(cidrString)
-		if err != nil {
-			t.Fatalf("failed to parse resize CIDR: %v", err)
-		}
-		_, err = repo.Update(ctx, id, repository.UpdateSubnet{CIDR: &cidr, CIDRSet: true})
+		_, err := repo.Update(ctx, id, repository.UpdateSubnet{CIDR: cidrString, CIDRSet: true})
 		return err
 	}
 
 	conflicts := []struct {
-		name    string
-		address string
-		status  string
+		name      string
+		address   string
+		status    string
+		candidate string
 	}{
-		{"C1_reserved_outside", "10.80.0.200", "reserved"},
-		{"C2_assigned_outside", "10.80.0.200", "assigned"},
-		{"C3_candidate_network", "10.80.0.0", "reserved"},
-		{"C4_candidate_broadcast", "10.80.0.127", "assigned"},
+		{"C1_reserved_outside", "10.80.0.200", "reserved", "10.80.0.0/25"},
+		{"C2_assigned_outside", "10.80.0.200", "assigned", "10.80.0.0/25"},
+		{"C3_candidate_network", "10.80.0.128", "reserved", "10.80.0.128/25"},
+		{"C4_candidate_broadcast", "10.80.0.127", "assigned", "10.80.0.0/25"},
 	}
 	for _, tc := range conflicts {
 		t.Run(tc.name, func(t *testing.T) {
 			resetTestData(t, db)
 			subnet := createTestSubnet(t, repo, "10.80.0.0/24", nil, tc.name)
+			if tc.name == "C3_candidate_network" {
+				usable, err := subnet.CIDR.IsUsableIPString(tc.address)
+				if err != nil || !usable {
+					t.Fatalf("C3 allocation %s must be usable in original %s: usable=%v err=%v", tc.address, subnet.CIDR.CIDR(), usable, err)
+				}
+				candidate, err := domain.ParseCIDR(tc.candidate)
+				if err != nil {
+					t.Fatalf("failed to parse C3 candidate: %v", err)
+				}
+				if candidate.Network() != tc.address {
+					t.Fatalf("C3 allocation %s must equal candidate network %s", tc.address, candidate.Network())
+				}
+			}
 			insertTestAllocation(t, db, subnet.ID, tc.address, tc.status)
 			before := snapshot(t, subnet.ID)
-			err := resize(t, subnet.ID, "10.80.0.0/25")
+			err := resize(t, subnet.ID, tc.candidate)
 			if !errors.Is(err, domain.ErrSubnetResizeConflict) {
 				t.Fatalf("resize error = %v, want ErrSubnetResizeConflict", err)
 			}
@@ -1164,7 +1175,7 @@ func TestSubnetRepo_Concurrency_CreateVsResize_AdvisoryWaitAndRecheck(t *testing
 	resizeCIDR, _ := domain.ParseCIDR("10.90.0.0/25")
 	resizeDone := make(chan error, 1)
 	go func() {
-		_, err := repo.Update(context.Background(), target.ID, repository.UpdateSubnet{CIDR: &resizeCIDR, CIDRSet: true})
+		_, err := repo.Update(context.Background(), target.ID, repository.UpdateSubnet{CIDR: resizeCIDR.CIDR(), CIDRSet: true})
 		resizeDone <- err
 	}()
 	waitForPostgresCondition(t, "Resize holding the shared advisory key", func() (bool, error) {
@@ -1219,7 +1230,7 @@ func TestSubnetRepo_Concurrency_ResizeVsResize_AdvisoryWaitAndRecheck(t *testing
 	cidrA, _ := domain.ParseCIDR("10.91.0.0/25")
 	doneA := make(chan error, 1)
 	go func() {
-		_, err := repo.Update(context.Background(), targetA.ID, repository.UpdateSubnet{CIDR: &cidrA, CIDRSet: true})
+		_, err := repo.Update(context.Background(), targetA.ID, repository.UpdateSubnet{CIDR: cidrA.CIDR(), CIDRSet: true})
 		doneA <- err
 	}()
 	waitForPostgresCondition(t, "Resize A holding advisory key", func() (bool, error) {
@@ -1230,7 +1241,7 @@ func TestSubnetRepo_Concurrency_ResizeVsResize_AdvisoryWaitAndRecheck(t *testing
 	cidrB, _ := domain.ParseCIDR("10.91.0.64/26")
 	doneB := make(chan error, 1)
 	go func() {
-		_, err := repo.Update(context.Background(), targetB.ID, repository.UpdateSubnet{CIDR: &cidrB, CIDRSet: true})
+		_, err := repo.Update(context.Background(), targetB.ID, repository.UpdateSubnet{CIDR: cidrB.CIDR(), CIDRSet: true})
 		doneB <- err
 	}()
 	waitForPostgresCondition(t, "Resize B waiting on Resize A advisory key", func() (bool, error) {
@@ -1273,7 +1284,7 @@ func TestSubnetRepo_ResizeSameCIDRStillWaitsForAdvisoryLock(t *testing.T) {
 	sameCIDR, _ := domain.ParseCIDR("10.92.0.0/24")
 	done := make(chan error, 1)
 	go func() {
-		_, err := repo.Update(context.Background(), target.ID, repository.UpdateSubnet{CIDR: &sameCIDR, CIDRSet: true})
+		_, err := repo.Update(context.Background(), target.ID, repository.UpdateSubnet{CIDR: sameCIDR.CIDR(), CIDRSet: true})
 		done <- err
 	}()
 	waitForPostgresCondition(t, "same-CIDR Resize advisory waiter", func() (bool, error) {
@@ -1290,6 +1301,78 @@ func TestSubnetRepo_ResizeSameCIDRStillWaitsForAdvisoryLock(t *testing.T) {
 	}
 	if err := <-done; err != nil {
 		t.Fatalf("same-CIDR Resize failed after lock release: %v", err)
+	}
+}
+
+func TestSubnetService_InvalidCIDRWaitsForResizeLocksBeforeValidation(t *testing.T) {
+	db := setupTestDB(t)
+	repo := postgres.NewSubnetRepository(db)
+	svc := service.NewSubnetService(repo)
+	ctx := context.Background()
+	target := createTestSubnet(t, repo, "10.95.0.0/24", nil, "invalid CIDR lock order")
+
+	// Hold the target row independently from the advisory key so the production
+	// service path can be observed at both required lock boundaries.
+	rowBlocker, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("failed to begin target row blocker: %v", err)
+	}
+	defer func() { _ = rowBlocker.Rollback() }()
+	if _, err := rowBlocker.Exec("SELECT id FROM subnets WHERE id=$1 FOR UPDATE", target.ID); err != nil {
+		t.Fatalf("failed to hold target row lock: %v", err)
+	}
+
+	advisoryBlocker, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("failed to begin advisory blocker: %v", err)
+	}
+	defer func() { _ = advisoryBlocker.Rollback() }()
+	if _, err := advisoryBlocker.Exec("SELECT pg_advisory_xact_lock($1)", postgres.SubnetCoordinationKey); err != nil {
+		t.Fatalf("failed to hold Subnet coordination key: %v", err)
+	}
+
+	invalidCIDR := "10.95.0.1/24" // non-canonical: host bits are set
+	done := make(chan error, 1)
+	go func() {
+		_, err := svc.UpdateSubnet(context.Background(), target.ID, service.UpdateSubnetRequest{
+			CIDR: &invalidCIDR, CIDRSet: true,
+		})
+		done <- err
+	}()
+
+	waitForPostgresCondition(t, "invalid-CIDR PATCH waiting for advisory key before validation", func() (bool, error) {
+		count, err := advisoryLockCount(db, false)
+		return count > 0, err
+	})
+	select {
+	case err := <-done:
+		t.Fatalf("invalid-CIDR PATCH returned before advisory release: %v", err)
+	default:
+	}
+
+	if err := advisoryBlocker.Commit(); err != nil {
+		t.Fatalf("failed to release advisory blocker: %v", err)
+	}
+	waitForPostgresCondition(t, "invalid-CIDR PATCH holding advisory key and waiting for target row", func() (bool, error) {
+		var observed bool
+		err := db.QueryRow(`
+			SELECT
+				EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND granted)
+				AND EXISTS(SELECT 1 FROM pg_locks WHERE locktype<>'advisory' AND NOT granted)
+		`).Scan(&observed)
+		return observed, err
+	})
+	select {
+	case err := <-done:
+		t.Fatalf("invalid-CIDR PATCH returned before target row release: %v", err)
+	default:
+	}
+
+	if err := rowBlocker.Commit(); err != nil {
+		t.Fatalf("failed to release target row blocker: %v", err)
+	}
+	if err := <-done; !errors.Is(err, domain.ErrInvalidCIDR) {
+		t.Fatalf("final invalid-CIDR PATCH error = %v, want ErrInvalidCIDR", err)
 	}
 }
 
@@ -1334,7 +1417,7 @@ func TestSubnetRepo_ParentRowLockBlocksChildAllocationInsert(t *testing.T) {
 	updateDone := make(chan error, 1)
 	go func() {
 		_, err := repo.Update(context.Background(), target.ID, repository.UpdateSubnet{
-			CIDR: &resizeCIDR, CIDRSet: true, Description: "locked parent", DescriptionSet: true,
+			CIDR: resizeCIDR.CIDR(), CIDRSet: true, Description: "locked parent", DescriptionSet: true,
 		})
 		updateDone <- err
 	}()

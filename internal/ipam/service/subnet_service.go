@@ -34,6 +34,17 @@ type CreateSubnetRequest struct {
 	Description string `json:"description"`
 }
 
+// UpdateSubnetRequest is presence-aware so PATCH can distinguish omitted,
+// explicit null, and supplied values before reaching the repository.
+type UpdateSubnetRequest struct {
+	CIDR           *string
+	CIDRSet        bool
+	VlanRefID      *int64
+	VlanRefIDSet   bool
+	Description    *string
+	DescriptionSet bool
+}
+
 // ListSubnetsRequest represents parameters for listing subnets.
 type ListSubnetsRequest struct {
 	VlanRefID *int64
@@ -89,9 +100,6 @@ func DecodeCursor(cursorStr string) (int64, error) {
 func ToDTO(s *domain.Subnet, assignedCount, reservedCount int64) *SubnetDTO {
 	usableCount := s.CIDR.UsableCount()
 	availableCount := usableCount - assignedCount - reservedCount
-	if availableCount < 0 {
-		availableCount = 0
-	}
 
 	return &SubnetDTO{
 		ID:             s.ID,
@@ -130,12 +138,12 @@ func (s *SubnetService) GetSubnet(ctx context.Context, id int64) (*SubnetDTO, er
 		return nil, domain.ErrSubnetNotFound
 	}
 
-	subnet, err := s.repo.GetByID(ctx, id)
+	read, err := s.repo.GetByID(ctx, id)
 	if err != nil {
 		return nil, err
 	}
 
-	return ToDTO(subnet, 0, 0), nil
+	return ToDTO(&read.Subnet, read.AssignedCount, read.ReservedCount), nil
 }
 
 // ListSubnets queries subnets matching filter with keyset pagination.
@@ -155,22 +163,14 @@ func (s *SubnetService) ListSubnets(ctx context.Context, req ListSubnetsRequest)
 		Cursor:    req.Cursor,
 	}
 
-	subnets, nextCursorID, err := s.repo.List(ctx, filter)
+	reads, nextCursorID, err := s.repo.List(ctx, filter)
 	if err != nil {
 		return nil, err
 	}
 
-	dtos := make([]*SubnetDTO, len(subnets))
-	for i, sub := range subnets {
-		// TODO(M2): transitional M1 behavior — Tech-Lead-authorized.
-		// assigned_count and reserved_count are hardcoded to 0 because ip_allocations
-		// persistence does not yet exist in M1. available_count therefore equals usable_count.
-		// M2 MUST replace these zero values with actual DB aggregates:
-		//   assigned_count  = COUNT(*) WHERE subnet_id=sub.ID AND status='assigned'
-		//   reserved_count  = COUNT(*) WHERE subnet_id=sub.ID AND status='reserved'
-		//   available_count = usable_count - assigned_count - reserved_count
-		// M2 MUST NOT close until GET /subnets and GET /subnets/{id} use these real counts.
-		dtos[i] = ToDTO(sub, 0, 0)
+	dtos := make([]*SubnetDTO, len(reads))
+	for i, read := range reads {
+		dtos[i] = ToDTO(&read.Subnet, read.AssignedCount, read.ReservedCount)
 	}
 
 	var nextCursorStr *string
@@ -186,4 +186,51 @@ func (s *SubnetService) ListSubnets(ctx context.Context, req ListSubnetsRequest)
 			NextCursor: nextCursorStr,
 		},
 	}, nil
+}
+
+// UpdateSubnet validates supplied values and delegates the locked merge and
+// transaction ordering to the repository.
+func (s *SubnetService) UpdateSubnet(ctx context.Context, id int64, req UpdateSubnetRequest) (*SubnetDTO, error) {
+	if id <= 0 || (!req.CIDRSet && !req.VlanRefIDSet && !req.DescriptionSet) {
+		return nil, domain.ErrInvalidRequest
+	}
+
+	patch := repository.UpdateSubnet{
+		CIDRSet:        req.CIDRSet,
+		VlanRefID:      req.VlanRefID,
+		VlanRefIDSet:   req.VlanRefIDSet,
+		DescriptionSet: req.DescriptionSet,
+	}
+	if req.CIDRSet {
+		if req.CIDR == nil {
+			return nil, domain.ErrInvalidRequest
+		}
+		cidr, err := domain.ParseCIDR(*req.CIDR)
+		if err != nil {
+			return nil, err
+		}
+		patch.CIDR = &cidr
+	}
+	if req.DescriptionSet {
+		if req.Description == nil {
+			return nil, domain.ErrInvalidRequest
+		}
+		patch.Description = *req.Description
+	}
+	if req.VlanRefIDSet && req.VlanRefID != nil && *req.VlanRefID <= 0 {
+		return nil, domain.ErrInvalidRequest
+	}
+
+	read, err := s.repo.Update(ctx, id, patch)
+	if err != nil {
+		return nil, err
+	}
+	return ToDTO(&read.Subnet, read.AssignedCount, read.ReservedCount), nil
+}
+
+func (s *SubnetService) DeleteSubnet(ctx context.Context, id int64) error {
+	if id <= 0 {
+		return domain.ErrInvalidRequest
+	}
+	return s.repo.Delete(ctx, id)
 }

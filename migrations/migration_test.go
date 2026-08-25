@@ -113,6 +113,14 @@ func TestPostgresMigrations(t *testing.T) {
 		t.Fatalf("failed to execute subnet up migration: %v", err)
 	}
 
+	allocationUp, err := os.ReadFile(filepath.Join(".", "000003_create_ip_allocations_table.up.sql"))
+	if err != nil {
+		t.Fatalf("failed to read ip_allocations up migration: %v", err)
+	}
+	if _, err := db.Exec(string(allocationUp)); err != nil {
+		t.Fatalf("failed to execute ip_allocations up migration: %v", err)
+	}
+
 	t.Log("UP migrations completed successfully")
 
 	// 3. Valid IPv4 subnet insert succeeds
@@ -201,7 +209,64 @@ func TestPostgresMigrations(t *testing.T) {
 	}
 	t.Log("Valid vlan_ref_id association succeeded")
 
-	// 5. Run DOWN migrations
+	// 5. ip_allocations exact PostgreSQL constraints.
+	// Use an IPv6 /32 so only the family check fails; /128 would also violate
+	// the independent hostmask=32 check and would not isolate this constraint.
+	_, err = db.Exec(`INSERT INTO ip_allocations (subnet_id, address, status) VALUES ($1, '2001:db8::/32', 'reserved')`, subnetID)
+	assertPQError(t, err, "23514", "ip_allocations_address_ipv4_chk")
+
+	_, err = db.Exec(`INSERT INTO ip_allocations (subnet_id, address, status) VALUES ($1, '192.168.1.10/24', 'reserved')`, subnetID)
+	assertPQError(t, err, "23514", "ip_allocations_address_hostmask_chk")
+
+	_, err = db.Exec(`INSERT INTO ip_allocations (subnet_id, address, status) VALUES ($1, '192.168.1.10', 'available')`, subnetID)
+	assertPQError(t, err, "23514", "ip_allocations_status_chk")
+
+	_, err = db.Exec(`INSERT INTO ip_allocations (subnet_id, address, status, interface_id) VALUES ($1, '192.168.1.10', 'reserved', 1)`, subnetID)
+	assertPQError(t, err, "23514", "ip_allocations_status_interface_chk")
+
+	_, err = db.Exec(`INSERT INTO ip_allocations (subnet_id, address, status) VALUES ($1, '192.168.1.10', 'assigned')`, subnetID)
+	assertPQError(t, err, "23514", "ip_allocations_status_interface_chk")
+
+	if _, err = db.Exec(`INSERT INTO ip_allocations (subnet_id, address, status) VALUES ($1, '192.168.1.10', 'reserved')`, subnetID); err != nil {
+		t.Fatalf("failed to insert valid reserved allocation: %v", err)
+	}
+	_, err = db.Exec(`INSERT INTO ip_allocations (subnet_id, address, status, interface_id) VALUES ($1, '192.168.1.10', 'assigned', 1)`, subnetID)
+	assertPQError(t, err, "23505", "ip_allocations_address_uq")
+
+	_, err = db.Exec(`INSERT INTO ip_allocations (subnet_id, address, status) VALUES (999999, '192.168.1.11', 'reserved')`)
+	assertPQError(t, err, "23503", "ip_allocations_subnet_id_fkey")
+
+	var allocationIndex string
+	if err := db.QueryRow(`SELECT indexname FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ip_allocations_subnet_id_idx'`).Scan(&allocationIndex); err != nil {
+		t.Fatalf("failed to verify ip_allocations_subnet_id_idx: %v", err)
+	}
+	if allocationIndex != "ip_allocations_subnet_id_idx" {
+		t.Fatalf("unexpected allocation index name %q", allocationIndex)
+	}
+
+	// The exact ON DELETE RESTRICT FK must independently protect allocations.
+	_, err = db.Exec(`DELETE FROM subnets WHERE id = $1`, subnetID)
+	// PostgreSQL reports the immediate ON DELETE RESTRICT action as 23001
+	// (restrict_violation). This separately proves the real FK behavior; the
+	// locked 23503 + exact-name application classifier has its own unit test.
+	assertPQError(t, err, "23001", "ip_allocations_subnet_id_fkey")
+
+	// 6. Run DOWN migrations
+	allocationDown, err := os.ReadFile(filepath.Join(".", "000003_create_ip_allocations_table.down.sql"))
+	if err != nil {
+		t.Fatalf("failed to read ip_allocations down migration: %v", err)
+	}
+	if _, err := db.Exec(string(allocationDown)); err != nil {
+		t.Fatalf("failed to execute ip_allocations down migration: %v", err)
+	}
+	var allocationsRegClass sql.NullString
+	if err := db.QueryRow("SELECT to_regclass('public.ip_allocations')").Scan(&allocationsRegClass); err != nil {
+		t.Fatalf("failed to query to_regclass('public.ip_allocations'): %v", err)
+	}
+	if allocationsRegClass.Valid {
+		t.Fatalf("expected public.ip_allocations table to be dropped, got regclass: %s", allocationsRegClass.String)
+	}
+
 	subnetDown, err := os.ReadFile(filepath.Join(".", "000002_create_subnets_table.down.sql"))
 	if err != nil {
 		t.Fatalf("failed to read subnet down migration: %v", err)
@@ -218,7 +283,7 @@ func TestPostgresMigrations(t *testing.T) {
 		t.Fatalf("failed to execute vlan down migration: %v", err)
 	}
 
-	// 6. Verify table absence via to_regclass
+	// 7. Verify table absence via to_regclass
 	var subnetsRegClass sql.NullString
 	if err := db.QueryRow("SELECT to_regclass('public.subnets')").Scan(&subnetsRegClass); err != nil {
 		t.Fatalf("failed to query to_regclass('public.subnets'): %v", err)
@@ -235,5 +300,5 @@ func TestPostgresMigrations(t *testing.T) {
 		t.Fatalf("expected public.vlans table to be dropped, got regclass: %s", vlansRegClass.String)
 	}
 
-	t.Log("DOWN migrations verified: public.subnets and public.vlans confirmed dropped")
+	t.Log("DOWN migrations verified: public.ip_allocations, public.subnets, and public.vlans confirmed dropped")
 }

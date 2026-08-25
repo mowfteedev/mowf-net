@@ -11,8 +11,10 @@ import (
 
 type mockSubnetRepo struct {
 	createFn  func(ctx context.Context, subnet *domain.Subnet) error
-	getByIDFn func(ctx context.Context, id int64) (*domain.Subnet, error)
-	listFn    func(ctx context.Context, filter repository.ListFilter) ([]*domain.Subnet, *int64, error)
+	getByIDFn func(ctx context.Context, id int64) (*repository.SubnetRead, error)
+	listFn    func(ctx context.Context, filter repository.ListFilter) ([]*repository.SubnetRead, *int64, error)
+	updateFn  func(ctx context.Context, id int64, patch repository.UpdateSubnet) (*repository.SubnetRead, error)
+	deleteFn  func(ctx context.Context, id int64) error
 }
 
 func (m *mockSubnetRepo) Create(ctx context.Context, subnet *domain.Subnet) error {
@@ -23,18 +25,32 @@ func (m *mockSubnetRepo) Create(ctx context.Context, subnet *domain.Subnet) erro
 	return nil
 }
 
-func (m *mockSubnetRepo) GetByID(ctx context.Context, id int64) (*domain.Subnet, error) {
+func (m *mockSubnetRepo) GetByID(ctx context.Context, id int64) (*repository.SubnetRead, error) {
 	if m.getByIDFn != nil {
 		return m.getByIDFn(ctx, id)
 	}
 	return nil, domain.ErrSubnetNotFound
 }
 
-func (m *mockSubnetRepo) List(ctx context.Context, filter repository.ListFilter) ([]*domain.Subnet, *int64, error) {
+func (m *mockSubnetRepo) List(ctx context.Context, filter repository.ListFilter) ([]*repository.SubnetRead, *int64, error) {
 	if m.listFn != nil {
 		return m.listFn(ctx, filter)
 	}
 	return nil, nil, nil
+}
+
+func (m *mockSubnetRepo) Update(ctx context.Context, id int64, patch repository.UpdateSubnet) (*repository.SubnetRead, error) {
+	if m.updateFn != nil {
+		return m.updateFn(ctx, id, patch)
+	}
+	return nil, domain.ErrSubnetNotFound
+}
+
+func (m *mockSubnetRepo) Delete(ctx context.Context, id int64) error {
+	if m.deleteFn != nil {
+		return m.deleteFn(ctx, id)
+	}
+	return domain.ErrSubnetNotFound
 }
 
 func TestSubnetService_CreateSubnet_Valid(t *testing.T) {
@@ -143,15 +159,15 @@ func TestSubnetService_CreateSubnet_RepoOverlapError(t *testing.T) {
 func TestSubnetService_GetSubnet(t *testing.T) {
 	cidr, _ := domain.ParseCIDR("10.0.0.0/8")
 	vlanRef := int64(7)
-	mockSub := &domain.Subnet{
+	mockSub := &repository.SubnetRead{Subnet: domain.Subnet{
 		ID:          10,
 		CIDR:        cidr,
 		VlanRefID:   &vlanRef,
 		Description: "Corporate WAN",
-	}
+	}, AssignedCount: 2, ReservedCount: 3}
 
 	repo := &mockSubnetRepo{
-		getByIDFn: func(ctx context.Context, id int64) (*domain.Subnet, error) {
+		getByIDFn: func(ctx context.Context, id int64) (*repository.SubnetRead, error) {
 			if id == 10 {
 				return mockSub, nil
 			}
@@ -174,8 +190,11 @@ func TestSubnetService_GetSubnet(t *testing.T) {
 		if dto.UsableCount != 16777214 {
 			t.Errorf("UsableCount = %d, want 16777214", dto.UsableCount)
 		}
-		if dto.AvailableCount != 16777214 {
-			t.Errorf("AvailableCount = %d, want 16777214", dto.AvailableCount)
+		if dto.AssignedCount != 2 || dto.ReservedCount != 3 {
+			t.Errorf("counts = assigned %d reserved %d, want 2 and 3", dto.AssignedCount, dto.ReservedCount)
+		}
+		if dto.AvailableCount != 16777209 {
+			t.Errorf("AvailableCount = %d, want 16777209", dto.AvailableCount)
 		}
 		if dto.VlanRefID == nil || *dto.VlanRefID != 7 {
 			t.Errorf("VlanRefID = %v, want 7", dto.VlanRefID)
@@ -206,14 +225,14 @@ func TestSubnetService_GetSubnet(t *testing.T) {
 func TestSubnetService_ListSubnets(t *testing.T) {
 	cidr1, _ := domain.ParseCIDR("192.168.1.0/24")
 	cidr2, _ := domain.ParseCIDR("192.168.2.0/24")
-	subnets := []*domain.Subnet{
-		{ID: 1, CIDR: cidr1, Description: "LAN 1"},
-		{ID: 2, CIDR: cidr2, Description: "LAN 2"},
+	subnets := []*repository.SubnetRead{
+		{Subnet: domain.Subnet{ID: 1, CIDR: cidr1, Description: "LAN 1"}, AssignedCount: 2, ReservedCount: 3},
+		{Subnet: domain.Subnet{ID: 2, CIDR: cidr2, Description: "LAN 2"}, ReservedCount: 1},
 	}
 
 	nextCursorID := int64(2)
 	repo := &mockSubnetRepo{
-		listFn: func(ctx context.Context, filter repository.ListFilter) ([]*domain.Subnet, *int64, error) {
+		listFn: func(ctx context.Context, filter repository.ListFilter) ([]*repository.SubnetRead, *int64, error) {
 			return subnets, &nextCursorID, nil
 		},
 	}
@@ -233,6 +252,10 @@ func TestSubnetService_ListSubnets(t *testing.T) {
 	if resp.Page.NextCursor == nil {
 		t.Fatalf("expected non-nil NextCursor")
 	}
+	if resp.Data[0].AssignedCount != 2 || resp.Data[0].ReservedCount != 3 || resp.Data[0].AvailableCount != 249 {
+		t.Fatalf("mixed /24 DTO counts = assigned %d reserved %d available %d, want 2/3/249",
+			resp.Data[0].AssignedCount, resp.Data[0].ReservedCount, resp.Data[0].AvailableCount)
+	}
 
 	decodedID, err := DecodeCursor(*resp.Page.NextCursor)
 	if err != nil {
@@ -241,6 +264,58 @@ func TestSubnetService_ListSubnets(t *testing.T) {
 	if decodedID != 2 {
 		t.Errorf("decoded cursor ID = %d, want 2", decodedID)
 	}
+}
+
+func TestSubnetService_UpdateAndDelete(t *testing.T) {
+	t.Run("valid update passes presence-aware patch", func(t *testing.T) {
+		cidr, _ := domain.ParseCIDR("192.168.50.0/24")
+		description := ""
+		vlanID := int64(5)
+		repo := &mockSubnetRepo{updateFn: func(ctx context.Context, id int64, patch repository.UpdateSubnet) (*repository.SubnetRead, error) {
+			if id != 9 || !patch.CIDRSet || patch.CIDR == nil || !patch.DescriptionSet || patch.Description != "" || !patch.VlanRefIDSet || patch.VlanRefID == nil || *patch.VlanRefID != 5 {
+				t.Fatalf("unexpected repository update: id=%d patch=%+v", id, patch)
+			}
+			return &repository.SubnetRead{Subnet: domain.Subnet{ID: id, CIDR: *patch.CIDR, Description: patch.Description, VlanRefID: patch.VlanRefID}}, nil
+		}}
+		svc := NewSubnetService(repo)
+		cidrString := cidr.CIDR()
+		if _, err := svc.UpdateSubnet(context.Background(), 9, UpdateSubnetRequest{
+			CIDR: &cidrString, CIDRSet: true, Description: &description, DescriptionSet: true,
+			VlanRefID: &vlanID, VlanRefIDSet: true,
+		}); err != nil {
+			t.Fatalf("valid UpdateSubnet failed: %v", err)
+		}
+	})
+
+	invalid := []UpdateSubnetRequest{
+		{},
+		{CIDRSet: true},
+		{DescriptionSet: true},
+		{VlanRefIDSet: true, VlanRefID: func() *int64 { v := int64(0); return &v }()},
+	}
+	for i, req := range invalid {
+		svc := NewSubnetService(&mockSubnetRepo{updateFn: func(context.Context, int64, repository.UpdateSubnet) (*repository.SubnetRead, error) {
+			t.Fatal("repository called for invalid service update")
+			return nil, nil
+		}})
+		if _, err := svc.UpdateSubnet(context.Background(), 1, req); !errors.Is(err, domain.ErrInvalidRequest) {
+			t.Errorf("invalid update %d error=%v, want ErrInvalidRequest", i, err)
+		}
+	}
+
+	t.Run("delete delegates", func(t *testing.T) {
+		called := false
+		svc := NewSubnetService(&mockSubnetRepo{deleteFn: func(ctx context.Context, id int64) error {
+			called = id == 8
+			return nil
+		}})
+		if err := svc.DeleteSubnet(context.Background(), 8); err != nil || !called {
+			t.Fatalf("DeleteSubnet error=%v called=%v", err, called)
+		}
+		if err := svc.DeleteSubnet(context.Background(), 0); !errors.Is(err, domain.ErrInvalidRequest) {
+			t.Fatalf("invalid DeleteSubnet error=%v", err)
+		}
+	})
 }
 
 func TestCursorEncodingDecoding(t *testing.T) {

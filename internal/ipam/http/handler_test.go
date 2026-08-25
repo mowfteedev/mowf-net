@@ -17,8 +17,10 @@ import (
 
 type mockSubnetRepo struct {
 	createFn  func(ctx context.Context, subnet *domain.Subnet) error
-	getByIDFn func(ctx context.Context, id int64) (*domain.Subnet, error)
-	listFn    func(ctx context.Context, filter repository.ListFilter) ([]*domain.Subnet, *int64, error)
+	getByIDFn func(ctx context.Context, id int64) (*repository.SubnetRead, error)
+	listFn    func(ctx context.Context, filter repository.ListFilter) ([]*repository.SubnetRead, *int64, error)
+	updateFn  func(ctx context.Context, id int64, patch repository.UpdateSubnet) (*repository.SubnetRead, error)
+	deleteFn  func(ctx context.Context, id int64) error
 }
 
 func (m *mockSubnetRepo) Create(ctx context.Context, subnet *domain.Subnet) error {
@@ -29,18 +31,32 @@ func (m *mockSubnetRepo) Create(ctx context.Context, subnet *domain.Subnet) erro
 	return nil
 }
 
-func (m *mockSubnetRepo) GetByID(ctx context.Context, id int64) (*domain.Subnet, error) {
+func (m *mockSubnetRepo) GetByID(ctx context.Context, id int64) (*repository.SubnetRead, error) {
 	if m.getByIDFn != nil {
 		return m.getByIDFn(ctx, id)
 	}
 	return nil, domain.ErrSubnetNotFound
 }
 
-func (m *mockSubnetRepo) List(ctx context.Context, filter repository.ListFilter) ([]*domain.Subnet, *int64, error) {
+func (m *mockSubnetRepo) List(ctx context.Context, filter repository.ListFilter) ([]*repository.SubnetRead, *int64, error) {
 	if m.listFn != nil {
 		return m.listFn(ctx, filter)
 	}
 	return nil, nil, nil
+}
+
+func (m *mockSubnetRepo) Update(ctx context.Context, id int64, patch repository.UpdateSubnet) (*repository.SubnetRead, error) {
+	if m.updateFn != nil {
+		return m.updateFn(ctx, id, patch)
+	}
+	return nil, domain.ErrSubnetNotFound
+}
+
+func (m *mockSubnetRepo) Delete(ctx context.Context, id int64) error {
+	if m.deleteFn != nil {
+		return m.deleteFn(ctx, id)
+	}
+	return domain.ErrSubnetNotFound
 }
 
 func setupTestServer(repo *mockSubnetRepo) *http.ServeMux {
@@ -332,15 +348,15 @@ func TestSubnetHandler_CreateSubnet_InternalError_Sanitized(t *testing.T) {
 func TestSubnetHandler_GetSubnet_Success(t *testing.T) {
 	cidr, _ := domain.ParseCIDR("192.168.10.0/24")
 	vlanRef := int64(5)
-	mockSub := &domain.Subnet{
+	mockSub := &repository.SubnetRead{Subnet: domain.Subnet{
 		ID:          10,
 		CIDR:        cidr,
 		VlanRefID:   &vlanRef,
 		Description: "Lab LAN",
-	}
+	}}
 
 	repo := &mockSubnetRepo{
-		getByIDFn: func(ctx context.Context, id int64) (*domain.Subnet, error) {
+		getByIDFn: func(ctx context.Context, id int64) (*repository.SubnetRead, error) {
 			if id == 10 {
 				return mockSub, nil
 			}
@@ -385,7 +401,7 @@ func TestSubnetHandler_GetSubnet_Success(t *testing.T) {
 
 func TestSubnetHandler_GetSubnet_NotFound(t *testing.T) {
 	repo := &mockSubnetRepo{
-		getByIDFn: func(ctx context.Context, id int64) (*domain.Subnet, error) {
+		getByIDFn: func(ctx context.Context, id int64) (*repository.SubnetRead, error) {
 			return nil, domain.ErrSubnetNotFound
 		},
 	}
@@ -444,7 +460,7 @@ func TestSubnetHandler_GetSubnet_InvalidPathID(t *testing.T) {
 
 func TestSubnetHandler_GetSubnet_InternalError_Sanitized(t *testing.T) {
 	repo := &mockSubnetRepo{
-		getByIDFn: func(ctx context.Context, id int64) (*domain.Subnet, error) {
+		getByIDFn: func(ctx context.Context, id int64) (*repository.SubnetRead, error) {
 			return nil, errors.New("pq: fatal error on db 10.0.0.1 password=secret")
 		},
 	}
@@ -479,13 +495,13 @@ func TestSubnetHandler_GetSubnet_InternalError_Sanitized(t *testing.T) {
 func TestSubnetHandler_ListSubnets_Success(t *testing.T) {
 	cidr1, _ := domain.ParseCIDR("192.168.1.0/24")
 	cidr2, _ := domain.ParseCIDR("192.168.2.0/24")
-	mockList := []*domain.Subnet{
-		{ID: 1, CIDR: cidr1, Description: "LAN 1"},
-		{ID: 2, CIDR: cidr2, Description: "LAN 2"},
+	mockList := []*repository.SubnetRead{
+		{Subnet: domain.Subnet{ID: 1, CIDR: cidr1, Description: "LAN 1"}},
+		{Subnet: domain.Subnet{ID: 2, CIDR: cidr2, Description: "LAN 2"}},
 	}
 
 	repo := &mockSubnetRepo{
-		listFn: func(ctx context.Context, filter repository.ListFilter) ([]*domain.Subnet, *int64, error) {
+		listFn: func(ctx context.Context, filter repository.ListFilter) ([]*repository.SubnetRead, *int64, error) {
 			next := int64(2)
 			return mockList, &next, nil
 		},
@@ -522,7 +538,7 @@ func TestSubnetHandler_ListSubnets_Success(t *testing.T) {
 func TestSubnetHandler_ListSubnets_DefaultLimit(t *testing.T) {
 	var capturedLimit int
 	repo := &mockSubnetRepo{
-		listFn: func(ctx context.Context, filter repository.ListFilter) ([]*domain.Subnet, *int64, error) {
+		listFn: func(ctx context.Context, filter repository.ListFilter) ([]*repository.SubnetRead, *int64, error) {
 			capturedLimit = filter.Limit
 			return nil, nil, nil
 		},
@@ -556,7 +572,7 @@ func TestSubnetHandler_ListSubnets_DefaultLimit(t *testing.T) {
 func TestSubnetHandler_ListSubnets_MaxLimit(t *testing.T) {
 	var capturedLimit int
 	repo := &mockSubnetRepo{
-		listFn: func(ctx context.Context, filter repository.ListFilter) ([]*domain.Subnet, *int64, error) {
+		listFn: func(ctx context.Context, filter repository.ListFilter) ([]*repository.SubnetRead, *int64, error) {
 			capturedLimit = filter.Limit
 			return nil, nil, nil
 		},
@@ -600,7 +616,7 @@ func TestSubnetHandler_ListSubnets_AboveMaxRejected(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			var repoCalled bool
 			repo := &mockSubnetRepo{
-				listFn: func(ctx context.Context, filter repository.ListFilter) ([]*domain.Subnet, *int64, error) {
+				listFn: func(ctx context.Context, filter repository.ListFilter) ([]*repository.SubnetRead, *int64, error) {
 					repoCalled = true
 					return nil, nil, nil
 				},
@@ -634,7 +650,7 @@ func TestSubnetHandler_ListSubnets_AboveMaxRejected(t *testing.T) {
 // returning to the client.
 func TestSubnetHandler_ListSubnets_InternalError_Sanitized(t *testing.T) {
 	repo := &mockSubnetRepo{
-		listFn: func(ctx context.Context, filter repository.ListFilter) ([]*domain.Subnet, *int64, error) {
+		listFn: func(ctx context.Context, filter repository.ListFilter) ([]*repository.SubnetRead, *int64, error) {
 			// Simulate a raw DB error containing sensitive internal details.
 			return nil, nil, errors.New("pq: connection failed host=10.0.0.1 password=secret sql=SELECT * FROM subnets")
 		},
@@ -701,6 +717,247 @@ func TestSubnetHandler_ListSubnets_MalformedParameters(t *testing.T) {
 
 			if errResp.Error.Code != "INVALID_REQUEST" {
 				t.Errorf("error.code = %s, want INVALID_REQUEST for %s", errResp.Error.Code, tt.name)
+			}
+		})
+	}
+}
+
+func TestSubnetHandler_Patch(t *testing.T) {
+	t.Run("successful presence-aware fields", func(t *testing.T) {
+		tests := []struct {
+			name  string
+			body  string
+			check func(t *testing.T, patch repository.UpdateSubnet)
+		}{
+			{"CIDR only", `{"cidr":"192.168.10.0/25"}`, func(t *testing.T, p repository.UpdateSubnet) {
+				if !p.CIDRSet || p.CIDR == nil || p.CIDR.CIDR() != "192.168.10.0/25" || p.DescriptionSet || p.VlanRefIDSet {
+					t.Fatalf("unexpected CIDR patch: %+v", p)
+				}
+			}},
+			{"description only", `{"description":"new"}`, func(t *testing.T, p repository.UpdateSubnet) {
+				if !p.DescriptionSet || p.Description != "new" || p.CIDRSet || p.VlanRefIDSet {
+					t.Fatalf("unexpected description patch: %+v", p)
+				}
+			}},
+			{"description empty", `{"description":""}`, func(t *testing.T, p repository.UpdateSubnet) {
+				if !p.DescriptionSet || p.Description != "" {
+					t.Fatalf("unexpected empty description patch: %+v", p)
+				}
+			}},
+			{"VLAN set", `{"vlan_ref_id":5}`, func(t *testing.T, p repository.UpdateSubnet) {
+				if !p.VlanRefIDSet || p.VlanRefID == nil || *p.VlanRefID != 5 {
+					t.Fatalf("unexpected VLAN patch: %+v", p)
+				}
+			}},
+			{"VLAN null unlink", `{"vlan_ref_id":null}`, func(t *testing.T, p repository.UpdateSubnet) {
+				if !p.VlanRefIDSet || p.VlanRefID != nil {
+					t.Fatalf("unexpected VLAN unlink patch: %+v", p)
+				}
+			}},
+			{"combined", `{"cidr":"192.168.10.0/25","description":"combined","vlan_ref_id":7}`, func(t *testing.T, p repository.UpdateSubnet) {
+				if !p.CIDRSet || !p.DescriptionSet || !p.VlanRefIDSet || p.VlanRefID == nil || *p.VlanRefID != 7 {
+					t.Fatalf("unexpected combined patch: %+v", p)
+				}
+			}},
+		}
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				baseCIDR, _ := domain.ParseCIDR("192.168.10.0/24")
+				repo := &mockSubnetRepo{updateFn: func(ctx context.Context, id int64, patch repository.UpdateSubnet) (*repository.SubnetRead, error) {
+					if id != 10 {
+						t.Fatalf("update id=%d, want 10", id)
+					}
+					tc.check(t, patch)
+					subnet := domain.Subnet{ID: id, CIDR: baseCIDR, Description: "old"}
+					if patch.CIDRSet {
+						subnet.CIDR = *patch.CIDR
+					}
+					if patch.DescriptionSet {
+						subnet.Description = patch.Description
+					}
+					if patch.VlanRefIDSet {
+						subnet.VlanRefID = patch.VlanRefID
+					}
+					return &repository.SubnetRead{Subnet: subnet, AssignedCount: 2, ReservedCount: 3}, nil
+				}}
+				mux := setupTestServer(repo)
+				req := httptest.NewRequest(http.MethodPatch, "/api/v1/subnets/10", bytes.NewBufferString(tc.body))
+				w := httptest.NewRecorder()
+				mux.ServeHTTP(w, req)
+				if w.Code != http.StatusOK {
+					t.Fatalf("status=%d, want 200; body=%s", w.Code, w.Body.String())
+				}
+				var response struct {
+					Data service.SubnetDTO `json:"data"`
+				}
+				if err := json.NewDecoder(w.Body).Decode(&response); err != nil {
+					t.Fatalf("failed to decode PATCH response: %v", err)
+				}
+				if response.Data.AssignedCount != 2 || response.Data.ReservedCount != 3 {
+					t.Fatalf("PATCH counts=%d/%d, want 2/3", response.Data.AssignedCount, response.Data.ReservedCount)
+				}
+			})
+		}
+	})
+
+	t.Run("invalid payload never calls repository", func(t *testing.T) {
+		tests := []struct {
+			name string
+			body string
+		}{
+			{"empty object", `{}`},
+			{"unknown field", `{"description":"x","unknown":1}`},
+			{"only unknown", `{"unknown":1}`},
+			{"malformed", `{"cidr":`},
+			{"trailing garbage", `{"description":"x"} garbage`},
+			{"second JSON value", `{"description":"x"} {"vlan_ref_id":1}`},
+			{"CIDR null", `{"cidr":null}`},
+			{"description null", `{"description":null}`},
+			{"VLAN zero", `{"vlan_ref_id":0}`},
+			{"VLAN negative", `{"vlan_ref_id":-1}`},
+			{"CIDR wrong type", `{"cidr":10}`},
+			{"description wrong type", `{"description":false}`},
+			{"VLAN wrong type", `{"vlan_ref_id":"5"}`},
+			{"VLAN fractional", `{"vlan_ref_id":1.5}`},
+		}
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				called := false
+				repo := &mockSubnetRepo{updateFn: func(ctx context.Context, id int64, patch repository.UpdateSubnet) (*repository.SubnetRead, error) {
+					called = true
+					return nil, nil
+				}}
+				mux := setupTestServer(repo)
+				req := httptest.NewRequest(http.MethodPatch, "/api/v1/subnets/10", bytes.NewBufferString(tc.body))
+				w := httptest.NewRecorder()
+				mux.ServeHTTP(w, req)
+				if w.Code != http.StatusBadRequest {
+					t.Fatalf("status=%d, want 400; body=%s", w.Code, w.Body.String())
+				}
+				var response ipamhttp.ErrorResponse
+				if err := json.NewDecoder(w.Body).Decode(&response); err != nil || response.Error.Code != "INVALID_REQUEST" {
+					t.Fatalf("error=%+v decode=%v, want INVALID_REQUEST", response, err)
+				}
+				if called {
+					t.Fatal("repository called for malformed PATCH")
+				}
+			})
+		}
+	})
+
+	t.Run("invalid and noncanonical CIDR", func(t *testing.T) {
+		called := false
+		repo := &mockSubnetRepo{updateFn: func(ctx context.Context, id int64, patch repository.UpdateSubnet) (*repository.SubnetRead, error) {
+			called = true
+			return nil, nil
+		}}
+		mux := setupTestServer(repo)
+		req := httptest.NewRequest(http.MethodPatch, "/api/v1/subnets/10", bytes.NewBufferString(`{"cidr":"192.168.10.5/24"}`))
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+		if w.Code != http.StatusBadRequest || !bytes.Contains(w.Body.Bytes(), []byte(`"INVALID_CIDR"`)) {
+			t.Fatalf("unexpected invalid CIDR response: status=%d body=%s", w.Code, w.Body.String())
+		}
+		if called {
+			t.Fatal("repository called for invalid CIDR")
+		}
+	})
+
+	t.Run("path ID errors", func(t *testing.T) {
+		for _, path := range []string{"/api/v1/subnets/abc", "/api/v1/subnets/0", "/api/v1/subnets/-1"} {
+			called := false
+			repo := &mockSubnetRepo{updateFn: func(ctx context.Context, id int64, patch repository.UpdateSubnet) (*repository.SubnetRead, error) {
+				called = true
+				return nil, nil
+			}}
+			mux := setupTestServer(repo)
+			req := httptest.NewRequest(http.MethodPatch, path, bytes.NewBufferString(`{"description":"x"}`))
+			w := httptest.NewRecorder()
+			mux.ServeHTTP(w, req)
+			if w.Code != http.StatusBadRequest || !bytes.Contains(w.Body.Bytes(), []byte(`"INVALID_REQUEST"`)) || called {
+				t.Fatalf("path=%s status=%d called=%v body=%s", path, w.Code, called, w.Body.String())
+			}
+		}
+	})
+
+	t.Run("domain and internal errors", func(t *testing.T) {
+		tests := []struct {
+			name       string
+			err        error
+			wantStatus int
+			wantCode   string
+		}{
+			{"missing subnet", domain.ErrSubnetNotFound, 404, "SUBNET_NOT_FOUND"},
+			{"missing VLAN", domain.ErrVlanNotFound, 404, "VLAN_NOT_FOUND"},
+			{"overlap", domain.ErrSubnetOverlap, 409, "SUBNET_OVERLAP"},
+			{"unsafe resize", domain.ErrSubnetResizeConflict, 409, "SUBNET_RESIZE_CONFLICT"},
+			{"internal", errors.New("pq: host=10.0.0.1 password=secret constraint=raw"), 500, "INTERNAL_ERROR"},
+		}
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				repo := &mockSubnetRepo{updateFn: func(ctx context.Context, id int64, patch repository.UpdateSubnet) (*repository.SubnetRead, error) {
+					return nil, tc.err
+				}}
+				mux := setupTestServer(repo)
+				req := httptest.NewRequest(http.MethodPatch, "/api/v1/subnets/10", bytes.NewBufferString(`{"description":"x"}`))
+				w := httptest.NewRecorder()
+				mux.ServeHTTP(w, req)
+				if w.Code != tc.wantStatus || !bytes.Contains(w.Body.Bytes(), []byte(`"`+tc.wantCode+`"`)) {
+					t.Fatalf("status=%d body=%s, want %d %s", w.Code, w.Body.String(), tc.wantStatus, tc.wantCode)
+				}
+				for _, secret := range []string{"secret", "10.0.0.1", "constraint=raw"} {
+					if bytes.Contains(w.Body.Bytes(), []byte(secret)) {
+						t.Fatalf("PATCH response leaked %q: %s", secret, w.Body.String())
+					}
+				}
+			})
+		}
+	})
+}
+
+func TestSubnetHandler_Delete(t *testing.T) {
+	tests := []struct {
+		name       string
+		path       string
+		repoErr    error
+		wantStatus int
+		wantCode   string
+	}{
+		{"success", "/api/v1/subnets/10", nil, http.StatusNoContent, ""},
+		{"invalid ID", "/api/v1/subnets/abc", nil, http.StatusBadRequest, "INVALID_REQUEST"},
+		{"nonpositive ID", "/api/v1/subnets/0", nil, http.StatusBadRequest, "INVALID_REQUEST"},
+		{"missing", "/api/v1/subnets/10", domain.ErrSubnetNotFound, http.StatusNotFound, "SUBNET_NOT_FOUND"},
+		{"allocations", "/api/v1/subnets/10", domain.ErrSubnetHasAllocations, http.StatusConflict, "SUBNET_HAS_ALLOCATIONS"},
+		{"internal", "/api/v1/subnets/10", errors.New("pq: password=secret host=10.0.0.1"), http.StatusInternalServerError, "INTERNAL_ERROR"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			called := false
+			repo := &mockSubnetRepo{deleteFn: func(ctx context.Context, id int64) error {
+				called = true
+				return tc.repoErr
+			}}
+			mux := setupTestServer(repo)
+			req := httptest.NewRequest(http.MethodDelete, tc.path, nil)
+			w := httptest.NewRecorder()
+			mux.ServeHTTP(w, req)
+			if w.Code != tc.wantStatus {
+				t.Fatalf("status=%d, want %d; body=%s", w.Code, tc.wantStatus, w.Body.String())
+			}
+			if tc.wantStatus == http.StatusNoContent {
+				if w.Body.Len() != 0 {
+					t.Fatalf("204 response body length=%d, want zero", w.Body.Len())
+				}
+			} else if !bytes.Contains(w.Body.Bytes(), []byte(`"`+tc.wantCode+`"`)) {
+				t.Fatalf("response body=%s, want code %s", w.Body.String(), tc.wantCode)
+			}
+			if (tc.path == "/api/v1/subnets/abc" || tc.path == "/api/v1/subnets/0") && called {
+				t.Fatal("repository called for invalid DELETE ID")
+			}
+			for _, secret := range []string{"secret", "10.0.0.1", "pq:"} {
+				if bytes.Contains(w.Body.Bytes(), []byte(secret)) {
+					t.Fatalf("DELETE response leaked %q: %s", secret, w.Body.String())
+				}
 			}
 		})
 	}

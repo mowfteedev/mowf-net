@@ -306,12 +306,30 @@ Allowed fields:
 }
 ```
 
-If CIDR changes, full overlap + allocation-safety validation is mandatory.
+PATCH fields are presence-aware:
 
-Conflicts:
+- an omitted field preserves its current value;
+- `cidr` must be a canonical IPv4 `/1..30` string; `null` is rejected;
+- `description` accepts any string, including `""`; `null` is rejected;
+- a positive integer `vlan_ref_id` sets the relationship;
+- `vlan_ref_id: null` unlinks the Subnet from its VLAN.
 
-- `409 SUBNET_OVERLAP`;
-- `409 SUBNET_RESIZE_CONFLICT`.
+An empty object, unknown fields, wrong field types, malformed JSON, trailing
+garbage, or a second JSON value is rejected with `400 INVALID_REQUEST`.
+When `cidr` is present, full global overlap and allocation usable-range safety
+validation is mandatory, including when the supplied CIDR equals the current
+CIDR.
+
+Success: `200 OK` using the single-resource envelope.
+
+Failures:
+
+- `400 INVALID_REQUEST` (invalid PATCH shape or field values);
+- `400 INVALID_CIDR` (invalid or non-canonical CIDR);
+- `404 SUBNET_NOT_FOUND` (target Subnet does not exist);
+- `404 VLAN_NOT_FOUND` (supplied positive `vlan_ref_id` does not exist);
+- `409 SUBNET_OVERLAP` (candidate CIDR overlaps another Subnet);
+- `409 SUBNET_RESIZE_CONFLICT` (an allocation would be outside the new usable host range).
 
 ### DELETE `/subnets/{subnet_id}`
 

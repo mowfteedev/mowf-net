@@ -15,26 +15,34 @@ import (
 	embeddedpostgres "github.com/fergusstrange/embedded-postgres"
 	_ "github.com/lib/pq"
 	"github.com/mowfteedev/mowf-net/internal/ipam/domain"
+	"github.com/mowfteedev/mowf-net/internal/ipam/repository"
 	"github.com/mowfteedev/mowf-net/internal/ipam/repository/postgres"
 )
 
-func getFreePort(t *testing.T) uint32 {
-	t.Helper()
+func acquireFreePort() (uint32, error) {
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		t.Fatalf("failed to acquire free TCP port: %v", err)
+		return 0, err
 	}
 	defer l.Close()
-	return uint32(l.Addr().(*net.TCPAddr).Port)
+	return uint32(l.Addr().(*net.TCPAddr).Port), nil
 }
 
-func setupTestDB(t *testing.T) *sql.DB {
-	t.Helper()
+var sharedTestDB *sql.DB
 
-	tempDir := t.TempDir()
+func TestMain(m *testing.M) {
+	tempDir, err := os.MkdirTemp("", "mowf-net-repository-postgres-")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to create PostgreSQL test directory: %v\n", err)
+		os.Exit(1)
+	}
 	runtimePath := filepath.Join(tempDir, "runtime")
 	dataPath := filepath.Join(tempDir, "data")
-	port := getFreePort(t)
+	port, err := acquireFreePort()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to acquire PostgreSQL test port: %v\n", err)
+		os.Exit(1)
+	}
 
 	config := embeddedpostgres.DefaultConfig().
 		Port(port).
@@ -46,46 +54,60 @@ func setupTestDB(t *testing.T) *sql.DB {
 
 	pg := embeddedpostgres.NewDatabase(config)
 	if err := pg.Start(); err != nil {
-		t.Fatalf("failed to start isolated embedded postgres: %v", err)
+		fmt.Fprintf(os.Stderr, "failed to start isolated embedded PostgreSQL: %v\n", err)
+		os.Exit(1)
 	}
-
-	t.Cleanup(func() {
-		_ = pg.Stop()
-	})
 
 	connStr := fmt.Sprintf("host=127.0.0.1 port=%d user=postgres password=postgres dbname=mowf_net_test sslmode=disable", port)
 	db, err := sql.Open("postgres", connStr)
 	if err != nil {
-		t.Fatalf("failed to open database connection: %v", err)
+		fmt.Fprintf(os.Stderr, "failed to open PostgreSQL test connection: %v\n", err)
+		_ = pg.Stop()
+		os.Exit(1)
 	}
-
-	t.Cleanup(func() {
-		_ = db.Close()
-	})
-
 	if err := db.Ping(); err != nil {
-		t.Fatalf("failed to ping isolated database: %v", err)
+		fmt.Fprintf(os.Stderr, "failed to ping isolated PostgreSQL: %v\n", err)
+		_ = db.Close()
+		_ = pg.Stop()
+		os.Exit(1)
 	}
 
-	// Apply migrations
 	migrationsDir := filepath.Join("..", "..", "..", "..", "migrations")
-	vlanUp, err := os.ReadFile(filepath.Join(migrationsDir, "000001_create_vlans_table.up.sql"))
-	if err != nil {
-		t.Fatalf("failed to read vlan up migration: %v", err)
-	}
-	if _, err := db.Exec(string(vlanUp)); err != nil {
-		t.Fatalf("failed to execute vlan up migration: %v", err)
+	for _, filename := range []string{
+		"000001_create_vlans_table.up.sql",
+		"000002_create_subnets_table.up.sql",
+		"000003_create_ip_allocations_table.up.sql",
+	} {
+		migration, readErr := os.ReadFile(filepath.Join(migrationsDir, filename))
+		if readErr != nil {
+			fmt.Fprintf(os.Stderr, "failed to read %s: %v\n", filename, readErr)
+			_ = db.Close()
+			_ = pg.Stop()
+			os.Exit(1)
+		}
+		if _, execErr := db.Exec(string(migration)); execErr != nil {
+			fmt.Fprintf(os.Stderr, "failed to execute %s: %v\n", filename, execErr)
+			_ = db.Close()
+			_ = pg.Stop()
+			os.Exit(1)
+		}
 	}
 
-	subnetUp, err := os.ReadFile(filepath.Join(migrationsDir, "000002_create_subnets_table.up.sql"))
-	if err != nil {
-		t.Fatalf("failed to read subnet up migration: %v", err)
-	}
-	if _, err := db.Exec(string(subnetUp)); err != nil {
-		t.Fatalf("failed to execute subnet up migration: %v", err)
-	}
+	sharedTestDB = db
+	code := m.Run()
+	_ = db.Close()
+	_ = pg.Stop()
+	_ = os.RemoveAll(tempDir)
+	os.Exit(code)
+}
 
-	return db
+func setupTestDB(t *testing.T) *sql.DB {
+	t.Helper()
+	if sharedTestDB == nil {
+		t.Fatal("shared PostgreSQL test database was not initialized")
+	}
+	resetTestData(t, sharedTestDB)
+	return sharedTestDB
 }
 
 func countSubnets(t *testing.T, db *sql.DB) int {
@@ -96,6 +118,43 @@ func countSubnets(t *testing.T, db *sql.DB) int {
 		t.Fatalf("failed to count subnets: %v", err)
 	}
 	return count
+}
+
+func resetTestData(t *testing.T, db *sql.DB) {
+	t.Helper()
+	if _, err := db.Exec("TRUNCATE TABLE ip_allocations, subnets, vlans RESTART IDENTITY CASCADE"); err != nil {
+		t.Fatalf("failed to reset isolated test data: %v", err)
+	}
+}
+
+func createTestSubnet(t *testing.T, repo *postgres.SubnetRepository, cidrString string, vlanRefID *int64, description string) domain.Subnet {
+	t.Helper()
+	cidr, err := domain.ParseCIDR(cidrString)
+	if err != nil {
+		t.Fatalf("failed to parse test CIDR %q: %v", cidrString, err)
+	}
+	subnet := domain.NewSubnet(cidr, vlanRefID, description)
+	if err := repo.Create(context.Background(), &subnet); err != nil {
+		t.Fatalf("failed to create test subnet %q: %v", cidrString, err)
+	}
+	return subnet
+}
+
+func insertTestAllocation(t *testing.T, db *sql.DB, subnetID int64, address, status string) int64 {
+	t.Helper()
+	var interfaceID any
+	if status == "assigned" {
+		// M1-B3 has no interface FK by design; a non-null test-only BIGINT is valid.
+		interfaceID = int64(1)
+	}
+	var id int64
+	if err := db.QueryRow(`
+		INSERT INTO ip_allocations (subnet_id, address, status, interface_id)
+		VALUES ($1, $2::inet, $3, $4) RETURNING id
+	`, subnetID, address, status, interfaceID).Scan(&id); err != nil {
+		t.Fatalf("failed to insert %s allocation %s: %v", status, address, err)
+	}
+	return id
 }
 
 func TestSubnetRepo_Create_Valid(t *testing.T) {
@@ -779,5 +838,608 @@ func TestSubnetRepo_List_PaginationAndFilters(t *testing.T) {
 	}
 	if len(searchNoMatch) != 0 {
 		t.Errorf("len(searchNoMatch) = %d, want 0", len(searchNoMatch))
+	}
+}
+
+func TestSubnetRepo_AllocationCounts_GetAndBoundedList(t *testing.T) {
+	db := setupTestDB(t)
+	repo := postgres.NewSubnetRepository(db)
+	ctx := context.Background()
+
+	var vlanID int64
+	if err := db.QueryRow("INSERT INTO vlans (vlan_id, name) VALUES (30, 'Count VLAN') RETURNING id").Scan(&vlanID); err != nil {
+		t.Fatalf("failed to insert count VLAN: %v", err)
+	}
+	noAlloc := createTestSubnet(t, repo, "10.70.0.0/24", &vlanID, "count page zero")
+	mixed := createTestSubnet(t, repo, "10.70.1.0/24", &vlanID, "count page mixed")
+	assignedOnly := createTestSubnet(t, repo, "10.70.2.0/24", nil, "count page assigned")
+	reservedOnly := createTestSubnet(t, repo, "10.70.3.0/24", &vlanID, "other reserved")
+
+	insertTestAllocation(t, db, assignedOnly.ID, "10.70.2.10", "assigned")
+	insertTestAllocation(t, db, reservedOnly.ID, "10.70.3.10", "reserved")
+	for _, address := range []string{"10.70.1.10", "10.70.1.11"} {
+		insertTestAllocation(t, db, mixed.ID, address, "assigned")
+	}
+	for _, address := range []string{"10.70.1.20", "10.70.1.21", "10.70.1.22"} {
+		insertTestAllocation(t, db, mixed.ID, address, "reserved")
+	}
+
+	zeroRead, err := repo.GetByID(ctx, noAlloc.ID)
+	if err != nil {
+		t.Fatalf("GetByID(no allocations) failed: %v", err)
+	}
+	if zeroRead.AssignedCount != 0 || zeroRead.ReservedCount != 0 {
+		t.Fatalf("no-allocation counts = %d/%d, want 0/0", zeroRead.AssignedCount, zeroRead.ReservedCount)
+	}
+	mixedRead, err := repo.GetByID(ctx, mixed.ID)
+	if err != nil {
+		t.Fatalf("GetByID(mixed) failed: %v", err)
+	}
+	if mixedRead.AssignedCount != 2 || mixedRead.ReservedCount != 3 {
+		t.Fatalf("mixed counts = %d/%d, want 2/3", mixedRead.AssignedCount, mixedRead.ReservedCount)
+	}
+
+	// Combined keyset pagination + VLAN + search proves that the bounded page
+	// remains correct after the aggregate join. The list implementation executes
+	// this as one SQL query, not one count query per Subnet.
+	page1, cursor, err := repo.List(ctx, postgres.ListFilter{VlanRefID: &vlanID, Search: "count page", Limit: 1})
+	if err != nil {
+		t.Fatalf("combined count page 1 failed: %v", err)
+	}
+	if len(page1) != 1 || page1[0].ID != noAlloc.ID || page1[0].AssignedCount != 0 || page1[0].ReservedCount != 0 {
+		t.Fatalf("unexpected combined page 1: %+v", page1)
+	}
+	if cursor == nil {
+		t.Fatal("combined count page 1 missing cursor")
+	}
+	page2, cursor2, err := repo.List(ctx, postgres.ListFilter{VlanRefID: &vlanID, Search: "count page", Limit: 1, Cursor: cursor})
+	if err != nil {
+		t.Fatalf("combined count page 2 failed: %v", err)
+	}
+	if len(page2) != 1 || page2[0].ID != mixed.ID || page2[0].AssignedCount != 2 || page2[0].ReservedCount != 3 {
+		t.Fatalf("unexpected combined page 2: %+v", page2)
+	}
+	if cursor2 != nil {
+		t.Fatalf("combined count page 2 cursor = %v, want nil", cursor2)
+	}
+
+	all, _, err := repo.List(ctx, postgres.ListFilter{Limit: 10})
+	if err != nil {
+		t.Fatalf("multi-subnet count list failed: %v", err)
+	}
+	want := map[int64][2]int64{
+		noAlloc.ID: {0, 0}, mixed.ID: {2, 3}, assignedOnly.ID: {1, 0}, reservedOnly.ID: {0, 1},
+	}
+	for _, read := range all {
+		counts := want[read.ID]
+		if read.AssignedCount != counts[0] || read.ReservedCount != counts[1] {
+			t.Errorf("subnet %d counts = %d/%d, want %d/%d", read.ID, read.AssignedCount, read.ReservedCount, counts[0], counts[1])
+		}
+	}
+}
+
+func TestSubnetRepo_ResizeBoundariesAndSafety(t *testing.T) {
+	db := setupTestDB(t)
+	repo := postgres.NewSubnetRepository(db)
+	ctx := context.Background()
+
+	type allocationSnapshot struct {
+		ID          int64
+		Address     string
+		Status      string
+		InterfaceID sql.NullInt64
+		Description string
+		CreatedAt   time.Time
+		UpdatedAt   time.Time
+	}
+	snapshot := func(t *testing.T, subnetID int64) []allocationSnapshot {
+		t.Helper()
+		rows, err := db.Query(`SELECT id, host(address), status, interface_id, description, created_at, updated_at FROM ip_allocations WHERE subnet_id=$1 ORDER BY id`, subnetID)
+		if err != nil {
+			t.Fatalf("failed to snapshot allocations: %v", err)
+		}
+		defer rows.Close()
+		var result []allocationSnapshot
+		for rows.Next() {
+			var item allocationSnapshot
+			if err := rows.Scan(&item.ID, &item.Address, &item.Status, &item.InterfaceID, &item.Description, &item.CreatedAt, &item.UpdatedAt); err != nil {
+				t.Fatalf("failed to scan allocation snapshot: %v", err)
+			}
+			result = append(result, item)
+		}
+		return result
+	}
+	resize := func(t *testing.T, id int64, cidrString string) error {
+		t.Helper()
+		cidr, err := domain.ParseCIDR(cidrString)
+		if err != nil {
+			t.Fatalf("failed to parse resize CIDR: %v", err)
+		}
+		_, err = repo.Update(ctx, id, repository.UpdateSubnet{CIDR: &cidr, CIDRSet: true})
+		return err
+	}
+
+	conflicts := []struct {
+		name    string
+		address string
+		status  string
+	}{
+		{"C1_reserved_outside", "10.80.0.200", "reserved"},
+		{"C2_assigned_outside", "10.80.0.200", "assigned"},
+		{"C3_candidate_network", "10.80.0.0", "reserved"},
+		{"C4_candidate_broadcast", "10.80.0.127", "assigned"},
+	}
+	for _, tc := range conflicts {
+		t.Run(tc.name, func(t *testing.T) {
+			resetTestData(t, db)
+			subnet := createTestSubnet(t, repo, "10.80.0.0/24", nil, tc.name)
+			insertTestAllocation(t, db, subnet.ID, tc.address, tc.status)
+			before := snapshot(t, subnet.ID)
+			err := resize(t, subnet.ID, "10.80.0.0/25")
+			if !errors.Is(err, domain.ErrSubnetResizeConflict) {
+				t.Fatalf("resize error = %v, want ErrSubnetResizeConflict", err)
+			}
+			after := snapshot(t, subnet.ID)
+			if fmt.Sprint(after) != fmt.Sprint(before) {
+				t.Fatalf("failed resize changed allocation: before=%+v after=%+v", before, after)
+			}
+		})
+	}
+
+	t.Run("C5_first_and_last_usable_safe_shrink", func(t *testing.T) {
+		resetTestData(t, db)
+		subnet := createTestSubnet(t, repo, "10.80.0.0/24", nil, "boundaries")
+		insertTestAllocation(t, db, subnet.ID, "10.80.0.1", "reserved")
+		insertTestAllocation(t, db, subnet.ID, "10.80.0.126", "assigned")
+		before := snapshot(t, subnet.ID)
+		if err := resize(t, subnet.ID, "10.80.0.0/25"); err != nil {
+			t.Fatalf("safe boundary shrink failed: %v", err)
+		}
+		after := snapshot(t, subnet.ID)
+		if fmt.Sprint(after) != fmt.Sprint(before) {
+			t.Fatalf("safe resize changed allocation: before=%+v after=%+v", before, after)
+		}
+	})
+
+	t.Run("safe_grow", func(t *testing.T) {
+		resetTestData(t, db)
+		subnet := createTestSubnet(t, repo, "10.80.0.0/25", nil, "grow")
+		insertTestAllocation(t, db, subnet.ID, "10.80.0.126", "reserved")
+		if err := resize(t, subnet.ID, "10.80.0.0/24"); err != nil {
+			t.Fatalf("safe grow failed: %v", err)
+		}
+	})
+
+	t.Run("overlap_excludes_target_but_checks_other_subnets", func(t *testing.T) {
+		resetTestData(t, db)
+		target := createTestSubnet(t, repo, "10.80.0.0/25", nil, "target")
+		_ = createTestSubnet(t, repo, "10.80.0.128/25", nil, "other")
+		if err := resize(t, target.ID, "10.80.0.0/24"); !errors.Is(err, domain.ErrSubnetOverlap) {
+			t.Fatalf("overlap resize error = %v, want ErrSubnetOverlap", err)
+		}
+	})
+}
+
+func TestSubnetRepo_UpdateFieldsAndDelete(t *testing.T) {
+	db := setupTestDB(t)
+	repo := postgres.NewSubnetRepository(db)
+	ctx := context.Background()
+
+	var vlanID int64
+	if err := db.QueryRow("INSERT INTO vlans (vlan_id, name) VALUES (81, 'Patch VLAN') RETURNING id").Scan(&vlanID); err != nil {
+		t.Fatalf("failed to insert patch VLAN: %v", err)
+	}
+	subnet := createTestSubnet(t, repo, "10.81.0.0/24", nil, "old")
+	read, err := repo.Update(ctx, subnet.ID, repository.UpdateSubnet{
+		VlanRefID: &vlanID, VlanRefIDSet: true, Description: "new", DescriptionSet: true,
+	})
+	if err != nil {
+		t.Fatalf("non-CIDR update failed: %v", err)
+	}
+	if read.Description != "new" || read.VlanRefID == nil || *read.VlanRefID != vlanID || read.CIDR.CIDR() != "10.81.0.0/24" {
+		t.Fatalf("unexpected non-CIDR update: %+v", read)
+	}
+	read, err = repo.Update(ctx, subnet.ID, repository.UpdateSubnet{VlanRefIDSet: true})
+	if err != nil || read.VlanRefID != nil {
+		t.Fatalf("VLAN unlink result=%+v error=%v", read, err)
+	}
+	missingVLAN := int64(999999)
+	if _, err := repo.Update(ctx, subnet.ID, repository.UpdateSubnet{VlanRefID: &missingVLAN, VlanRefIDSet: true}); !errors.Is(err, domain.ErrVlanNotFound) {
+		t.Fatalf("missing VLAN update error = %v, want ErrVlanNotFound", err)
+	}
+	if _, err := repo.Update(ctx, 999999, repository.UpdateSubnet{Description: "x", DescriptionSet: true}); !errors.Is(err, domain.ErrSubnetNotFound) {
+		t.Fatalf("missing Subnet update error = %v, want ErrSubnetNotFound", err)
+	}
+
+	for _, status := range []string{"reserved", "assigned"} {
+		t.Run("delete_blocked_"+status, func(t *testing.T) {
+			resetTestData(t, db)
+			sub := createTestSubnet(t, repo, "10.82.0.0/24", nil, status)
+			allocationID := insertTestAllocation(t, db, sub.ID, "10.82.0.10", status)
+			if err := repo.Delete(ctx, sub.ID); !errors.Is(err, domain.ErrSubnetHasAllocations) {
+				t.Fatalf("delete error = %v, want ErrSubnetHasAllocations", err)
+			}
+			var remaining int
+			if err := db.QueryRow("SELECT COUNT(*) FROM ip_allocations WHERE id=$1 AND subnet_id=$2", allocationID, sub.ID).Scan(&remaining); err != nil || remaining != 1 {
+				t.Fatalf("allocation did not remain after rejected delete: count=%d err=%v", remaining, err)
+			}
+		})
+	}
+
+	t.Run("delete_no_allocations", func(t *testing.T) {
+		resetTestData(t, db)
+		sub := createTestSubnet(t, repo, "10.82.0.0/24", nil, "delete")
+		if err := repo.Delete(ctx, sub.ID); err != nil {
+			t.Fatalf("delete without allocations failed: %v", err)
+		}
+		if _, err := repo.GetByID(ctx, sub.ID); !errors.Is(err, domain.ErrSubnetNotFound) {
+			t.Fatalf("deleted subnet still exists: %v", err)
+		}
+		if err := repo.Delete(ctx, sub.ID); !errors.Is(err, domain.ErrSubnetNotFound) {
+			t.Fatalf("missing delete error = %v, want ErrSubnetNotFound", err)
+		}
+	})
+
+	t.Run("delete_does_not_use_global_advisory", func(t *testing.T) {
+		resetTestData(t, db)
+		sub := createTestSubnet(t, repo, "10.82.0.0/24", nil, "delete without advisory")
+		blocker, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatalf("failed to begin advisory blocker: %v", err)
+		}
+		if _, err := blocker.Exec("SELECT pg_advisory_xact_lock($1)", postgres.SubnetCoordinationKey); err != nil {
+			t.Fatalf("failed to hold global advisory key: %v", err)
+		}
+		done := make(chan error, 1)
+		go func() { done <- repo.Delete(context.Background(), sub.ID) }()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("Delete failed while unrelated advisory key was held: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			_ = blocker.Rollback()
+			<-done
+			t.Fatal("Delete waited on the global Subnet advisory key")
+		}
+		if err := blocker.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+			t.Fatalf("failed to release advisory blocker: %v", err)
+		}
+	})
+}
+
+func waitForPostgresCondition(t *testing.T, description string, condition func() (bool, error)) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		ok, err := condition()
+		if err != nil {
+			t.Fatalf("failed while observing %s: %v", description, err)
+		}
+		if ok {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timed out observing %s", description)
+}
+
+func advisoryLockCount(db *sql.DB, granted bool) (int, error) {
+	var count int
+	err := db.QueryRow("SELECT COUNT(*) FROM pg_locks WHERE locktype='advisory' AND granted=$1", granted).Scan(&count)
+	return count, err
+}
+
+func assertNoCommittedOverlap(t *testing.T, db *sql.DB) {
+	t.Helper()
+	var count int
+	if err := db.QueryRow(`
+		SELECT COUNT(*) FROM subnets a JOIN subnets b ON a.id < b.id
+		WHERE set_masklen(a.network, a.prefix_length) && set_masklen(b.network, b.prefix_length)
+	`).Scan(&count); err != nil {
+		t.Fatalf("failed to inspect committed overlap: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("found %d overlapping committed subnet pairs", count)
+	}
+}
+
+func TestSubnetRepo_Concurrency_CreateVsResize_AdvisoryWaitAndRecheck(t *testing.T) {
+	db := setupTestDB(t)
+	repo := postgres.NewSubnetRepository(db)
+	ctx := context.Background()
+	target := createTestSubnet(t, repo, "10.90.0.0/26", nil, "resize target")
+
+	// Hold the target row so production Resize can acquire the global advisory
+	// lock and then deterministically pause at its required FOR UPDATE.
+	rowBlocker, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("failed to start row blocker: %v", err)
+	}
+	defer func() { _ = rowBlocker.Rollback() }()
+	if _, err := rowBlocker.Exec("SELECT id FROM subnets WHERE id=$1 FOR UPDATE", target.ID); err != nil {
+		t.Fatalf("failed to lock resize target: %v", err)
+	}
+
+	resizeCIDR, _ := domain.ParseCIDR("10.90.0.0/25")
+	resizeDone := make(chan error, 1)
+	go func() {
+		_, err := repo.Update(context.Background(), target.ID, repository.UpdateSubnet{CIDR: &resizeCIDR, CIDRSet: true})
+		resizeDone <- err
+	}()
+	waitForPostgresCondition(t, "Resize holding the shared advisory key", func() (bool, error) {
+		count, err := advisoryLockCount(db, true)
+		return count > 0, err
+	})
+
+	createDone := make(chan error, 1)
+	go func() {
+		candidateCIDR, _ := domain.ParseCIDR("10.90.0.64/26")
+		candidate := domain.NewSubnet(candidateCIDR, nil, "create competitor")
+		createDone <- repo.Create(context.Background(), &candidate)
+	}()
+	waitForPostgresCondition(t, "Create waiting on Resize advisory key", func() (bool, error) {
+		count, err := advisoryLockCount(db, false)
+		return count > 0, err
+	})
+	select {
+	case err := <-createDone:
+		t.Fatalf("Create completed before advisory holder release: %v", err)
+	default:
+	}
+
+	if err := rowBlocker.Commit(); err != nil {
+		t.Fatalf("failed to release resize row blocker: %v", err)
+	}
+	if err := <-resizeDone; err != nil {
+		t.Fatalf("Resize failed: %v", err)
+	}
+	if err := <-createDone; !errors.Is(err, domain.ErrSubnetOverlap) {
+		t.Fatalf("serialized Create error = %v, want ErrSubnetOverlap", err)
+	}
+	assertNoCommittedOverlap(t, db)
+}
+
+func TestSubnetRepo_Concurrency_ResizeVsResize_AdvisoryWaitAndRecheck(t *testing.T) {
+	db := setupTestDB(t)
+	repo := postgres.NewSubnetRepository(db)
+	ctx := context.Background()
+	targetA := createTestSubnet(t, repo, "10.91.0.0/26", nil, "resize A")
+	targetB := createTestSubnet(t, repo, "10.91.0.128/26", nil, "resize B")
+
+	rowBlocker, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("failed to start row blocker: %v", err)
+	}
+	defer func() { _ = rowBlocker.Rollback() }()
+	if _, err := rowBlocker.Exec("SELECT id FROM subnets WHERE id=$1 FOR UPDATE", targetA.ID); err != nil {
+		t.Fatalf("failed to lock resize A: %v", err)
+	}
+
+	cidrA, _ := domain.ParseCIDR("10.91.0.0/25")
+	doneA := make(chan error, 1)
+	go func() {
+		_, err := repo.Update(context.Background(), targetA.ID, repository.UpdateSubnet{CIDR: &cidrA, CIDRSet: true})
+		doneA <- err
+	}()
+	waitForPostgresCondition(t, "Resize A holding advisory key", func() (bool, error) {
+		count, err := advisoryLockCount(db, true)
+		return count > 0, err
+	})
+
+	cidrB, _ := domain.ParseCIDR("10.91.0.64/26")
+	doneB := make(chan error, 1)
+	go func() {
+		_, err := repo.Update(context.Background(), targetB.ID, repository.UpdateSubnet{CIDR: &cidrB, CIDRSet: true})
+		doneB <- err
+	}()
+	waitForPostgresCondition(t, "Resize B waiting on Resize A advisory key", func() (bool, error) {
+		count, err := advisoryLockCount(db, false)
+		return count > 0, err
+	})
+	select {
+	case err := <-doneB:
+		t.Fatalf("Resize B completed before advisory release: %v", err)
+	default:
+	}
+
+	if err := rowBlocker.Commit(); err != nil {
+		t.Fatalf("failed to release resize A blocker: %v", err)
+	}
+	if err := <-doneA; err != nil {
+		t.Fatalf("Resize A failed: %v", err)
+	}
+	if err := <-doneB; !errors.Is(err, domain.ErrSubnetOverlap) {
+		t.Fatalf("serialized Resize B error = %v, want ErrSubnetOverlap", err)
+	}
+	assertNoCommittedOverlap(t, db)
+}
+
+func TestSubnetRepo_ResizeSameCIDRStillWaitsForAdvisoryLock(t *testing.T) {
+	db := setupTestDB(t)
+	repo := postgres.NewSubnetRepository(db)
+	ctx := context.Background()
+	target := createTestSubnet(t, repo, "10.92.0.0/24", nil, "same CIDR")
+
+	blocker, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("failed to begin advisory blocker: %v", err)
+	}
+	defer func() { _ = blocker.Rollback() }()
+	if _, err := blocker.Exec("SELECT pg_advisory_xact_lock($1)", postgres.SubnetCoordinationKey); err != nil {
+		t.Fatalf("failed to hold advisory key: %v", err)
+	}
+
+	sameCIDR, _ := domain.ParseCIDR("10.92.0.0/24")
+	done := make(chan error, 1)
+	go func() {
+		_, err := repo.Update(context.Background(), target.ID, repository.UpdateSubnet{CIDR: &sameCIDR, CIDRSet: true})
+		done <- err
+	}()
+	waitForPostgresCondition(t, "same-CIDR Resize advisory waiter", func() (bool, error) {
+		count, err := advisoryLockCount(db, false)
+		return count > 0, err
+	})
+	select {
+	case err := <-done:
+		t.Fatalf("same-CIDR Resize completed before lock release: %v", err)
+	default:
+	}
+	if err := blocker.Commit(); err != nil {
+		t.Fatalf("failed to release advisory blocker: %v", err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("same-CIDR Resize failed after lock release: %v", err)
+	}
+}
+
+func TestSubnetRepo_ParentRowLockBlocksChildAllocationInsert(t *testing.T) {
+	db := setupTestDB(t)
+	repo := postgres.NewSubnetRepository(db)
+	ctx := context.Background()
+	target := createTestSubnet(t, repo, "10.93.0.0/24", nil, "parent lock")
+
+	// The isolated test trigger pauses production Resize during UPDATE. At this
+	// point its earlier SELECT ... FOR UPDATE has locked the real parent row.
+	// Production code is unchanged.
+	const pauseKey int64 = 0x4D4F574650415553
+	if _, err := db.Exec(fmt.Sprintf(`
+		CREATE FUNCTION test_pause_subnet_update() RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN
+			PERFORM pg_advisory_xact_lock(%d);
+			RETURN NEW;
+		END $$;
+		CREATE TRIGGER test_pause_subnet_update_trigger
+		BEFORE UPDATE ON subnets FOR EACH ROW EXECUTE FUNCTION test_pause_subnet_update();
+	`, pauseKey)); err != nil {
+		t.Fatalf("failed to install isolated pause trigger: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = db.Exec(`
+			DROP TRIGGER IF EXISTS test_pause_subnet_update_trigger ON subnets;
+			DROP FUNCTION IF EXISTS test_pause_subnet_update();
+		`)
+	})
+
+	pauseHolder, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("failed to begin pause holder: %v", err)
+	}
+	defer func() { _ = pauseHolder.Rollback() }()
+	if _, err := pauseHolder.Exec("SELECT pg_advisory_xact_lock($1)", pauseKey); err != nil {
+		t.Fatalf("failed to hold pause key: %v", err)
+	}
+
+	resizeCIDR, _ := domain.ParseCIDR("10.93.0.0/24")
+	updateDone := make(chan error, 1)
+	go func() {
+		_, err := repo.Update(context.Background(), target.ID, repository.UpdateSubnet{
+			CIDR: &resizeCIDR, CIDRSet: true, Description: "locked parent", DescriptionSet: true,
+		})
+		updateDone <- err
+	}()
+	waitForPostgresCondition(t, "production Resize paused after parent row lock", func() (bool, error) {
+		count, err := advisoryLockCount(db, false)
+		return count > 0, err
+	})
+
+	childConn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("failed to pin child connection: %v", err)
+	}
+	defer childConn.Close()
+	var childPID int
+	if err := childConn.QueryRowContext(ctx, "SELECT pg_backend_pid()").Scan(&childPID); err != nil {
+		t.Fatalf("failed to obtain child backend PID: %v", err)
+	}
+	childDone := make(chan error, 1)
+	go func() {
+		_, err := childConn.ExecContext(context.Background(), `
+			INSERT INTO ip_allocations (subnet_id, address, status)
+			VALUES ($1, '10.93.0.10', 'reserved')
+		`, target.ID)
+		childDone <- err
+	}()
+	waitForPostgresCondition(t, "child FK check waiting on parent row lock", func() (bool, error) {
+		var waitType sql.NullString
+		err := db.QueryRow("SELECT wait_event_type FROM pg_stat_activity WHERE pid=$1", childPID).Scan(&waitType)
+		return waitType.Valid && waitType.String == "Lock", err
+	})
+	select {
+	case err := <-childDone:
+		t.Fatalf("child INSERT completed before parent release: %v", err)
+	default:
+	}
+
+	if err := pauseHolder.Commit(); err != nil {
+		t.Fatalf("failed to release production Resize: %v", err)
+	}
+	if err := <-updateDone; err != nil {
+		t.Fatalf("production Resize failed: %v", err)
+	}
+	if err := <-childDone; err != nil {
+		t.Fatalf("child INSERT failed after parent release: %v", err)
+	}
+
+	// Future M2 allocation writers must lock/read the target Subnet, validate
+	// against that locked row, then INSERT in the same transaction. A stale
+	// pre-transaction read followed by INSERT is not a valid allocation workflow.
+	var count int
+	if err := db.QueryRow("SELECT COUNT(*) FROM ip_allocations WHERE subnet_id=$1", target.ID).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("unexpected child allocation result count=%d err=%v", count, err)
+	}
+}
+
+func TestSubnetRepo_PartialPatchConcurrentMergePreventsLostUpdate(t *testing.T) {
+	db := setupTestDB(t)
+	repo := postgres.NewSubnetRepository(db)
+	ctx := context.Background()
+	target := createTestSubnet(t, repo, "10.94.0.0/24", nil, "original")
+	var vlanID int64
+	if err := db.QueryRow("INSERT INTO vlans (vlan_id, name) VALUES (94, 'Concurrent VLAN') RETURNING id").Scan(&vlanID); err != nil {
+		t.Fatalf("failed to insert concurrent VLAN: %v", err)
+	}
+
+	blocker, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("failed to begin row blocker: %v", err)
+	}
+	defer func() { _ = blocker.Rollback() }()
+	if _, err := blocker.Exec("SELECT id FROM subnets WHERE id=$1 FOR UPDATE", target.ID); err != nil {
+		t.Fatalf("failed to block partial patches: %v", err)
+	}
+
+	descriptionDone := make(chan error, 1)
+	go func() {
+		_, err := repo.Update(context.Background(), target.ID, repository.UpdateSubnet{Description: "description A", DescriptionSet: true})
+		descriptionDone <- err
+	}()
+	vlanDone := make(chan error, 1)
+	go func() {
+		_, err := repo.Update(context.Background(), target.ID, repository.UpdateSubnet{VlanRefID: &vlanID, VlanRefIDSet: true})
+		vlanDone <- err
+	}()
+	select {
+	case err := <-descriptionDone:
+		t.Fatalf("description patch completed while target row was blocked: %v", err)
+	case err := <-vlanDone:
+		t.Fatalf("VLAN patch completed while target row was blocked: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if err := blocker.Commit(); err != nil {
+		t.Fatalf("failed to release partial patches: %v", err)
+	}
+	if err := <-descriptionDone; err != nil {
+		t.Fatalf("description patch failed: %v", err)
+	}
+	if err := <-vlanDone; err != nil {
+		t.Fatalf("VLAN patch failed: %v", err)
+	}
+	read, err := repo.GetByID(ctx, target.ID)
+	if err != nil {
+		t.Fatalf("failed to fetch merged Subnet: %v", err)
+	}
+	if read.Description != "description A" || read.VlanRefID == nil || *read.VlanRefID != vlanID {
+		t.Fatalf("partial update lost a concurrent field: %+v", read)
 	}
 }

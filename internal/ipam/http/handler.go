@@ -1,6 +1,7 @@
 package http
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"io"
@@ -44,6 +45,8 @@ func (h *SubnetHandler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/v1/subnets", h.CreateSubnet)
 	mux.HandleFunc("GET /api/v1/subnets", h.ListSubnets)
 	mux.HandleFunc("GET /api/v1/subnets/{subnet_id}", h.GetSubnet)
+	mux.HandleFunc("PATCH /api/v1/subnets/{subnet_id}", h.PatchSubnet)
+	mux.HandleFunc("DELETE /api/v1/subnets/{subnet_id}", h.DeleteSubnet)
 }
 
 // CreateSubnet handles POST /api/v1/subnets.
@@ -171,6 +174,122 @@ func (h *SubnetHandler) ListSubnets(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// PatchSubnet handles presence-aware PATCH /api/v1/subnets/{subnet_id}.
+func (h *SubnetHandler) PatchSubnet(w http.ResponseWriter, r *http.Request) {
+	id, ok := parsePositivePathID(r.PathValue("subnet_id"))
+	if !ok {
+		writeError(w, http.StatusBadRequest, "INVALID_REQUEST", "Invalid subnet ID")
+		return
+	}
+
+	req, err := decodeUpdateSubnetRequest(r.Body)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "INVALID_REQUEST", "Invalid request payload")
+		return
+	}
+
+	dto, err := h.service.UpdateSubnet(r.Context(), id, req)
+	if err != nil {
+		writeSubnetMutationError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, DataResponse{Data: dto})
+}
+
+// DeleteSubnet handles DELETE /api/v1/subnets/{subnet_id}.
+func (h *SubnetHandler) DeleteSubnet(w http.ResponseWriter, r *http.Request) {
+	id, ok := parsePositivePathID(r.PathValue("subnet_id"))
+	if !ok {
+		writeError(w, http.StatusBadRequest, "INVALID_REQUEST", "Invalid subnet ID")
+		return
+	}
+	if err := h.service.DeleteSubnet(r.Context(), id); err != nil {
+		writeSubnetMutationError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func decodeUpdateSubnetRequest(body io.Reader) (service.UpdateSubnetRequest, error) {
+	var fields map[string]json.RawMessage
+	dec := json.NewDecoder(body)
+	if err := dec.Decode(&fields); err != nil {
+		return service.UpdateSubnetRequest{}, err
+	}
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		return service.UpdateSubnetRequest{}, domain.ErrInvalidRequest
+	}
+	if len(fields) == 0 {
+		return service.UpdateSubnetRequest{}, domain.ErrInvalidRequest
+	}
+
+	var req service.UpdateSubnetRequest
+	for name, raw := range fields {
+		switch name {
+		case "cidr":
+			req.CIDRSet = true
+			if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+				return service.UpdateSubnetRequest{}, domain.ErrInvalidRequest
+			}
+			var value string
+			if err := json.Unmarshal(raw, &value); err != nil {
+				return service.UpdateSubnetRequest{}, domain.ErrInvalidRequest
+			}
+			req.CIDR = &value
+		case "description":
+			req.DescriptionSet = true
+			if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+				return service.UpdateSubnetRequest{}, domain.ErrInvalidRequest
+			}
+			var value string
+			if err := json.Unmarshal(raw, &value); err != nil {
+				return service.UpdateSubnetRequest{}, domain.ErrInvalidRequest
+			}
+			req.Description = &value
+		case "vlan_ref_id":
+			req.VlanRefIDSet = true
+			if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+				req.VlanRefID = nil
+				continue
+			}
+			var value int64
+			if err := json.Unmarshal(raw, &value); err != nil || value <= 0 {
+				return service.UpdateSubnetRequest{}, domain.ErrInvalidRequest
+			}
+			req.VlanRefID = &value
+		default:
+			return service.UpdateSubnetRequest{}, domain.ErrInvalidRequest
+		}
+	}
+	return req, nil
+}
+
+func parsePositivePathID(value string) (int64, bool) {
+	id, err := strconv.ParseInt(value, 10, 64)
+	return id, err == nil && id > 0
+}
+
+func writeSubnetMutationError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, domain.ErrInvalidRequest):
+		writeError(w, http.StatusBadRequest, "INVALID_REQUEST", "Invalid request payload")
+	case errors.Is(err, domain.ErrInvalidCIDR):
+		writeError(w, http.StatusBadRequest, "INVALID_CIDR", "The provided CIDR is invalid or non-canonical.")
+	case errors.Is(err, domain.ErrSubnetNotFound):
+		writeError(w, http.StatusNotFound, "SUBNET_NOT_FOUND", "The requested subnet was not found.")
+	case errors.Is(err, domain.ErrVlanNotFound):
+		writeError(w, http.StatusNotFound, "VLAN_NOT_FOUND", "The referenced VLAN was not found.")
+	case errors.Is(err, domain.ErrSubnetOverlap):
+		writeError(w, http.StatusConflict, "SUBNET_OVERLAP", "The subnet overlaps with an existing subnet.")
+	case errors.Is(err, domain.ErrSubnetResizeConflict):
+		writeError(w, http.StatusConflict, "SUBNET_RESIZE_CONFLICT", "The subnet cannot be resized while allocations would leave its usable range.")
+	case errors.Is(err, domain.ErrSubnetHasAllocations):
+		writeError(w, http.StatusConflict, "SUBNET_HAS_ALLOCATIONS", "The subnet cannot be deleted while allocations exist.")
+	default:
+		writeError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "An internal server error occurred.")
+	}
 }
 
 func writeJSON(w http.ResponseWriter, statusCode int, payload any) {

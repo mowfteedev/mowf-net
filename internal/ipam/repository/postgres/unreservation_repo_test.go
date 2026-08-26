@@ -75,6 +75,29 @@ func waitForX1AdvisoryWaiter(t *testing.T, db *sql.DB, holderPID int, queryFragm
 	})
 }
 
+func waitForX2QueryBlockedByPID(t *testing.T, db *sql.DB, holderPID int, queryFragment string) {
+	t.Helper()
+	waitForPostgresCondition(t, fmt.Sprintf("X2 query %q blocked by backend %d", queryFragment, holderPID), func() (bool, error) {
+		var waiting bool
+		err := db.QueryRow(`
+			SELECT EXISTS (
+				SELECT 1
+				FROM pg_stat_activity waiter
+				JOIN pg_stat_activity holder
+				  ON holder.pid = $1
+				 AND holder.datname = current_database()
+				WHERE waiter.pid <> holder.pid
+				  AND waiter.datname = current_database()
+				  AND waiter.state = 'active'
+				  AND waiter.wait_event_type = 'Lock'
+				  AND holder.pid = ANY(pg_blocking_pids(waiter.pid))
+				  AND position($2 in waiter.query) > 0
+			)
+		`, holderPID, queryFragment).Scan(&waiting)
+		return waiting, err
+	})
+}
+
 func receiveX1HTTPResponse(t *testing.T, description string, done <-chan *httptest.ResponseRecorder) *httptest.ResponseRecorder {
 	t.Helper()
 	select {
@@ -552,6 +575,222 @@ func TestM2Harden01UnreserveVsSubnetResizeDeterministicOrderings(t *testing.T) {
 		}
 		if finalState.CIDR.CIDR() != resizedCIDR || finalState.ReservedCount != 0 || countX1SubnetAllocations(t, db, subnet.ID) != 0 || countAddressRows(t, db, target) != 0 {
 			t.Fatalf("final state = cidr:%s reserved:%d rows:%d target_rows:%d", finalState.CIDR.CIDR(), finalState.ReservedCount, countX1SubnetAllocations(t, db, subnet.ID), countAddressRows(t, db, target))
+		}
+	})
+}
+
+func TestM2Harden02UnreserveVsSubnetDeleteDeterministicOrderings(t *testing.T) {
+	const (
+		cidr                    = "10.137.0.0/24"
+		target                  = "10.137.0.20"
+		subnetHasAllocationsMsg = "The subnet cannot be deleted while allocations exist."
+	)
+
+	t.Run("subnet delete observes allocation before unreserve commit", func(t *testing.T) {
+		db := setupTestDB(t)
+		ctx := context.Background()
+		subnetRepo := postgres.NewSubnetRepository(db)
+		allocationRepo := postgres.NewAllocationRepository(db)
+		mux := setupUnreservationTestMux(subnetRepo, allocationRepo)
+		subnet := createTestSubnet(t, subnetRepo, cidr, nil, "X2 uncommitted Unreserve")
+		allocationID := insertAllocation(t, db, subnet.ID, target, domain.AllocationStatusReserved, nil, "X2 child allocation")
+
+		pauseKey := time.Now().UnixNano()
+		if pauseKey == postgres.SubnetCoordinationKey {
+			pauseKey++
+		}
+		functionName := fmt.Sprintf("x2_pause_delete_fn_%d", pauseKey)
+		triggerName := fmt.Sprintf("x2_pause_delete_trg_%d", pauseKey)
+		if _, err := db.Exec(fmt.Sprintf(`
+			CREATE FUNCTION %s() RETURNS trigger LANGUAGE plpgsql AS $$
+			BEGIN
+				PERFORM pg_advisory_xact_lock(%d);
+				RETURN OLD;
+			END $$;
+			CREATE TRIGGER %s
+			BEFORE DELETE ON ip_allocations
+			FOR EACH ROW WHEN (OLD.id = %d)
+			EXECUTE FUNCTION %s();
+		`, functionName, pauseKey, triggerName, allocationID, functionName)); err != nil {
+			t.Fatalf("install X2 Unreserve pause trigger: %v", err)
+		}
+		t.Cleanup(func() {
+			_, _ = db.Exec(fmt.Sprintf(`
+				DROP TRIGGER IF EXISTS %s ON ip_allocations;
+				DROP FUNCTION IF EXISTS %s();
+			`, triggerName, functionName))
+		})
+
+		pauseHolder, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pauseHolderDone := false
+		t.Cleanup(func() {
+			if !pauseHolderDone {
+				_ = pauseHolder.Rollback()
+			}
+		})
+		var pauseHolderPID int
+		if err := pauseHolder.QueryRow("SELECT pg_backend_pid()").Scan(&pauseHolderPID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pauseHolder.Exec("SELECT pg_advisory_xact_lock($1)", pauseKey); err != nil {
+			t.Fatal(err)
+		}
+
+		unreserveDone := make(chan *httptest.ResponseRecorder, 1)
+		go func() {
+			unreserveDone <- serveUnreservationRequest(mux, http.MethodDelete, fmt.Sprintf("/api/v1/ip-allocations/%d", allocationID), "")
+		}()
+		waitForX1AdvisoryWaiter(t, db, pauseHolderPID, "DELETE FROM ip_allocations")
+		select {
+		case response := <-unreserveDone:
+			t.Fatalf("Unreserve completed before X2 pause release: status=%d body=%s", response.Code, response.Body.String())
+		default:
+		}
+
+		subnetDeleteDone := make(chan *httptest.ResponseRecorder, 1)
+		go func() {
+			subnetDeleteDone <- serveUnreservationRequest(mux, http.MethodDelete, fmt.Sprintf("/api/v1/subnets/%d", subnet.ID), "")
+		}()
+		subnetDeleteResponse := receiveX1HTTPResponse(t, "Subnet Delete conflict while Unreserve remains paused", subnetDeleteDone)
+		if subnetDeleteResponse.Code != http.StatusConflict {
+			t.Fatalf("Subnet Delete status/body = %d/%s, want 409", subnetDeleteResponse.Code, subnetDeleteResponse.Body.String())
+		}
+		var conflict ipamhttp.ErrorResponse
+		if err := json.NewDecoder(subnetDeleteResponse.Body).Decode(&conflict); err != nil ||
+			conflict.Error.Code != "SUBNET_HAS_ALLOCATIONS" || conflict.Error.Message != subnetHasAllocationsMsg {
+			t.Fatalf("Subnet Delete conflict response = %#v, decode error = %v", conflict, err)
+		}
+
+		whilePaused, err := subnetRepo.GetByID(ctx, subnet.ID)
+		if err != nil {
+			t.Fatalf("Subnet missing while Unreserve paused: %v", err)
+		}
+		if whilePaused.CIDR.CIDR() != cidr || whilePaused.ReservedCount != 1 ||
+			countX1SubnetAllocations(t, db, subnet.ID) != 1 || countAddressRows(t, db, target) != 1 {
+			t.Fatalf("state while Unreserve paused = cidr:%s reserved:%d rows:%d target_rows:%d",
+				whilePaused.CIDR.CIDR(), whilePaused.ReservedCount, countX1SubnetAllocations(t, db, subnet.ID), countAddressRows(t, db, target))
+		}
+		select {
+		case response := <-unreserveDone:
+			t.Fatalf("Unreserve completed before barrier release after Subnet Delete: status=%d body=%s", response.Code, response.Body.String())
+		default:
+		}
+
+		if err := pauseHolder.Commit(); err != nil {
+			t.Fatal(err)
+		}
+		pauseHolderDone = true
+		unreserveResponse := receiveX1HTTPResponse(t, "Unreserve after X2 pause release", unreserveDone)
+		if unreserveResponse.Code != http.StatusNoContent || unreserveResponse.Body.Len() != 0 {
+			t.Fatalf("Unreserve status/body = %d/%q, want 204/empty", unreserveResponse.Code, unreserveResponse.Body.String())
+		}
+
+		finalState, err := subnetRepo.GetByID(ctx, subnet.ID)
+		if err != nil {
+			t.Fatalf("Subnet missing after completed Unreserve: %v", err)
+		}
+		if finalState.CIDR.CIDR() != cidr || finalState.ReservedCount != 0 ||
+			countX1SubnetAllocations(t, db, subnet.ID) != 0 || countAddressRows(t, db, target) != 0 {
+			t.Fatalf("final state = cidr:%s reserved:%d rows:%d target_rows:%d",
+				finalState.CIDR.CIDR(), finalState.ReservedCount, countX1SubnetAllocations(t, db, subnet.ID), countAddressRows(t, db, target))
+		}
+	})
+
+	t.Run("unreserve commits before subnet delete allocation check", func(t *testing.T) {
+		db := setupTestDB(t)
+		ctx := context.Background()
+		subnetRepo := postgres.NewSubnetRepository(db)
+		allocationRepo := postgres.NewAllocationRepository(db)
+		mux := setupUnreservationTestMux(subnetRepo, allocationRepo)
+		subnet := createTestSubnet(t, subnetRepo, cidr, nil, "X2 committed Unreserve")
+		allocationID := insertAllocation(t, db, subnet.ID, target, domain.AllocationStatusReserved, nil, "X2 child allocation")
+
+		parentHolder, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		parentHolderDone := false
+		t.Cleanup(func() {
+			if !parentHolderDone {
+				_ = parentHolder.Rollback()
+			}
+		})
+		var parentHolderPID int
+		var lockedSubnetID int64
+		if err := parentHolder.QueryRow("SELECT pg_backend_pid()").Scan(&parentHolderPID); err != nil {
+			t.Fatal(err)
+		}
+		if err := parentHolder.QueryRow("SELECT id FROM subnets WHERE id = $1 FOR UPDATE", subnet.ID).Scan(&lockedSubnetID); err != nil {
+			t.Fatal(err)
+		}
+		if lockedSubnetID != subnet.ID {
+			t.Fatalf("locked Subnet ID = %d, want %d", lockedSubnetID, subnet.ID)
+		}
+
+		subnetDeleteDone := make(chan *httptest.ResponseRecorder, 1)
+		go func() {
+			subnetDeleteDone <- serveUnreservationRequest(mux, http.MethodDelete, fmt.Sprintf("/api/v1/subnets/%d", subnet.ID), "")
+		}()
+		waitForX2QueryBlockedByPID(t, db, parentHolderPID, "SELECT id FROM subnets WHERE id = $1 FOR UPDATE")
+		select {
+		case response := <-subnetDeleteDone:
+			t.Fatalf("Subnet Delete completed before parent lock release: status=%d body=%s", response.Code, response.Body.String())
+		default:
+		}
+
+		unreserveDone := make(chan *httptest.ResponseRecorder, 1)
+		go func() {
+			unreserveDone <- serveUnreservationRequest(mux, http.MethodDelete, fmt.Sprintf("/api/v1/ip-allocations/%d", allocationID), "")
+		}()
+		unreserveResponse := receiveX1HTTPResponse(t, "Unreserve while Subnet Delete is parent-lock blocked", unreserveDone)
+		if unreserveResponse.Code != http.StatusNoContent || unreserveResponse.Body.Len() != 0 {
+			t.Fatalf("Unreserve status/body = %d/%q, want 204/empty", unreserveResponse.Code, unreserveResponse.Body.String())
+		}
+
+		var parentCount, subnetAllocationCount, targetAllocationCount, totalAllocationCount int
+		if err := db.QueryRow(`
+			SELECT
+				(SELECT COUNT(*) FROM subnets WHERE id = $1),
+				(SELECT COUNT(*) FROM ip_allocations WHERE subnet_id = $1),
+				(SELECT COUNT(*) FROM ip_allocations WHERE id = $2),
+				(SELECT COUNT(*) FROM ip_allocations)
+		`, subnet.ID, allocationID).Scan(&parentCount, &subnetAllocationCount, &targetAllocationCount, &totalAllocationCount); err != nil {
+			t.Fatalf("inspect X2 state before parent release: %v", err)
+		}
+		if parentCount != 1 || subnetAllocationCount != 0 || targetAllocationCount != 0 || totalAllocationCount != 0 {
+			t.Fatalf("state before parent release = parent:%d subnet_rows:%d target_rows:%d total_rows:%d",
+				parentCount, subnetAllocationCount, targetAllocationCount, totalAllocationCount)
+		}
+		select {
+		case response := <-subnetDeleteDone:
+			t.Fatalf("Subnet Delete completed after Unreserve but before parent lock release: status=%d body=%s", response.Code, response.Body.String())
+		default:
+		}
+
+		if err := parentHolder.Commit(); err != nil {
+			t.Fatal(err)
+		}
+		parentHolderDone = true
+		subnetDeleteResponse := receiveX1HTTPResponse(t, "Subnet Delete after committed Unreserve", subnetDeleteDone)
+		if subnetDeleteResponse.Code != http.StatusNoContent || subnetDeleteResponse.Body.Len() != 0 {
+			t.Fatalf("Subnet Delete status/body = %d/%q, want 204/empty", subnetDeleteResponse.Code, subnetDeleteResponse.Body.String())
+		}
+
+		if err := db.QueryRow(`
+			SELECT
+				(SELECT COUNT(*) FROM subnets WHERE id = $1),
+				(SELECT COUNT(*) FROM ip_allocations WHERE subnet_id = $1),
+				(SELECT COUNT(*) FROM ip_allocations WHERE id = $2),
+				(SELECT COUNT(*) FROM ip_allocations)
+		`, subnet.ID, allocationID).Scan(&parentCount, &subnetAllocationCount, &targetAllocationCount, &totalAllocationCount); err != nil {
+			t.Fatalf("inspect final X2 state: %v", err)
+		}
+		if parentCount != 0 || subnetAllocationCount != 0 || targetAllocationCount != 0 || totalAllocationCount != 0 {
+			t.Fatalf("final state = parent:%d subnet_rows:%d target_rows:%d total_rows:%d",
+				parentCount, subnetAllocationCount, targetAllocationCount, totalAllocationCount)
 		}
 	})
 }

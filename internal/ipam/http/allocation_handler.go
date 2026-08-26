@@ -145,9 +145,9 @@ func parsePositiveQueryID(value string) (int64, error) {
 }
 
 func decodeReserveAllocationRequest(body io.Reader) (service.ReserveAllocationRequest, error) {
-	var fields map[string]json.RawMessage
 	decoder := json.NewDecoder(body)
-	if err := decoder.Decode(&fields); err != nil {
+	fields, err := decodeUniqueTopLevelObject(decoder)
+	if err != nil {
 		return service.ReserveAllocationRequest{}, domain.ErrInvalidRequest
 	}
 	if err := decoder.Decode(&struct{}{}); err != io.EOF {
@@ -184,6 +184,40 @@ func decodeReserveAllocationRequest(body io.Reader) (service.ReserveAllocationRe
 		}
 	}
 	return req, nil
+}
+
+func decodeUniqueTopLevelObject(decoder *json.Decoder) (map[string]json.RawMessage, error) {
+	token, err := decoder.Token()
+	if err != nil || token != json.Delim('{') {
+		return nil, domain.ErrInvalidRequest
+	}
+
+	fields := make(map[string]json.RawMessage)
+	for decoder.More() {
+		token, err := decoder.Token()
+		if err != nil {
+			return nil, domain.ErrInvalidRequest
+		}
+		name, ok := token.(string)
+		if !ok {
+			return nil, domain.ErrInvalidRequest
+		}
+		if _, exists := fields[name]; exists {
+			return nil, domain.ErrInvalidRequest
+		}
+
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil {
+			return nil, domain.ErrInvalidRequest
+		}
+		fields[name] = value
+	}
+
+	token, err = decoder.Token()
+	if err != nil || token != json.Delim('}') {
+		return nil, domain.ErrInvalidRequest
+	}
+	return fields, nil
 }
 
 func writeReserveAllocationError(w http.ResponseWriter, err error) {

@@ -331,6 +331,81 @@ func TestAllocationHandler_ReserveAllocationCreatedAndDescriptionDefaults(t *tes
 	}
 }
 
+func TestAllocationHandler_ReserveAllocationRejectsDuplicateTopLevelKeys(t *testing.T) {
+	tests := []struct {
+		name        string
+		body        string
+		rawFragment string
+	}{
+		{
+			name: "subnet_id with different values",
+			body: `{"subnet_id":9,"subnet_id":10,"address":"192.168.10.20"}`,
+		},
+		{
+			name: "address",
+			body: `{"subnet_id":10,"address":"192.168.10.21","address":"192.168.10.20"}`,
+		},
+		{
+			name: "description",
+			body: `{"subnet_id":10,"address":"192.168.10.20","description":"first","description":"second"}`,
+		},
+		{
+			name: "subnet_id with identical values",
+			body: `{"subnet_id":10,"subnet_id":10,"address":"192.168.10.20"}`,
+		},
+		{
+			name:        "escaped-equivalent address",
+			body:        `{"subnet_id":10,"address":"192.168.10.20","\u0061ddress":"192.168.10.21"}`,
+			rawFragment: `"\u0061ddress"`,
+		},
+		{
+			name: "separated by formatting",
+			body: "{\n\t\"description\": \"first\",\n\t\"subnet_id\": 10,\n\t\"address\": \"192.168.10.20\",\n\t\"description\" : \"second\"\n}",
+		},
+		{
+			name: "appearing three times",
+			body: `{"subnet_id":9,"subnet_id":8,"address":"192.168.10.20","subnet_id":10}`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.rawFragment != "" && !strings.Contains(tc.body, tc.rawFragment) {
+				t.Fatalf("request body %q does not contain raw JSON fragment %q", tc.body, tc.rawFragment)
+			}
+			beginCalls := 0
+			mux := setupSuccessfulAllocationReservationServer(t, &beginCalls)
+
+			w := httptest.NewRecorder()
+			mux.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/api/v1/ip-allocations", strings.NewReader(tc.body)))
+
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d; BeginReservation calls = %d; body = %s", w.Code, http.StatusBadRequest, beginCalls, w.Body.String())
+			}
+			assertReserveAllocationInvalidRequest(t, w)
+			if beginCalls != 0 {
+				t.Fatalf("BeginReservation calls = %d, want 0", beginCalls)
+			}
+		})
+	}
+}
+
+func TestAllocationHandler_ReserveAllocationAcceptsUniqueTopLevelKeys(t *testing.T) {
+	beginCalls := 0
+	mux := setupSuccessfulAllocationReservationServer(t, &beginCalls)
+	body := `{"description":"Printer reservation","address":"192.168.10.20","subnet_id":10}`
+
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/api/v1/ip-allocations", strings.NewReader(body)))
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d; body = %s", w.Code, http.StatusCreated, w.Body.String())
+	}
+	if beginCalls != 1 {
+		t.Fatalf("BeginReservation calls = %d, want 1", beginCalls)
+	}
+}
+
 func TestAllocationHandler_ReserveAllocationRejectsOversizedValidLookingPayload(t *testing.T) {
 	beginCalls := 0
 	mux := setupSuccessfulAllocationReservationServer(t, &beginCalls)
@@ -354,6 +429,24 @@ func TestAllocationHandler_ReserveAllocationRejectsOversizedPayloadWithUnknownCo
 
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, req)
+
+	assertReserveAllocationInvalidRequest(t, w)
+	if beginCalls != 0 {
+		t.Fatalf("BeginReservation calls = %d, want 0", beginCalls)
+	}
+}
+
+func TestAllocationHandler_ReserveAllocationRejectsValidPrefixWithOversizedTrailingWhitespace(t *testing.T) {
+	beginCalls := 0
+	mux := setupSuccessfulAllocationReservationServer(t, &beginCalls)
+	const validBody = `{"subnet_id":10,"address":"192.168.10.20"}`
+	body := validBody + strings.Repeat(" ", 16*1024+1-len(validBody))
+	if len(body) != 16385 {
+		t.Fatalf("body size = %d, want 16385", len(body))
+	}
+
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/api/v1/ip-allocations", strings.NewReader(body)))
 
 	assertReserveAllocationInvalidRequest(t, w)
 	if beginCalls != 0 {
@@ -406,9 +499,14 @@ func TestAllocationHandler_ReserveAllocationStrictInvalidPayloadDoesNotBeginTran
 	invalidBodies := map[string]string{
 		"empty":                 "",
 		"null object":           "null",
+		"array":                 `[]`,
+		"string":                `"request"`,
+		"number":                `10`,
 		"empty object":          `{}`,
 		"missing subnet":        `{"address":"192.168.10.20"}`,
 		"missing address":       `{"subnet_id":10}`,
+		"null subnet":           `{"subnet_id":null,"address":"192.168.10.20"}`,
+		"null address":          `{"subnet_id":10,"address":null}`,
 		"zero subnet":           `{"subnet_id":0,"address":"192.168.10.20"}`,
 		"negative subnet":       `{"subnet_id":-1,"address":"192.168.10.20"}`,
 		"subnet wrong type":     `{"subnet_id":"10","address":"192.168.10.20"}`,
@@ -422,6 +520,7 @@ func TestAllocationHandler_ReserveAllocationStrictInvalidPayloadDoesNotBeginTran
 		"malformed JSON":        `{"subnet_id":10,`,
 		"second JSON value":     `{"subnet_id":10,"address":"192.168.10.20"} {}`,
 		"trailing JSON content": `{"subnet_id":10,"address":"192.168.10.20"} true`,
+		"trailing garbage":      `{"subnet_id":10,"address":"192.168.10.20"} garbage`,
 	}
 	for name, body := range invalidBodies {
 		t.Run(name, func(t *testing.T) {

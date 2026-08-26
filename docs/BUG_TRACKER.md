@@ -35,10 +35,10 @@ P5 = INFO       (architectural observation or performance note with no correctne
 | **M1 Historical Findings** | 8 | 8 | 0 | 0 |
 | **M1 Hardening & Debt** | 3 | 0 | 3 | 0 |
 | **M2 Historical & Protected** | 10 | 10 | 0 | 0 |
-| **M2 Audit Findings** | 4 | 2 | 1 | 1 |
+| **M2 Audit Findings** | 4 | 3 | 0 | 1 |
 | **M2 Concurrency Hardening** | 3 | 0 | 3 | 0 |
 | **M2 Info / Observations** | 1 | 0 | 1 | 0 |
-| **Total** | **29** | **20** | **8** | **1** |
+| **Total** | **29** | **21** | **7** | **1** |
 
 ---
 
@@ -236,11 +236,11 @@ P5 = INFO       (architectural observation or performance note with no correctne
 - **Problem:** Request body reaches `json.NewDecoder` without explicit size bounding (e.g. `http.MaxBytesReader`), creating potential memory exhaustion risk on oversized payloads.
 - **Expected Fix:** Wrap `r.Body` with `http.MaxBytesReader` appropriate for reservation payloads and add oversized-payload regression test.
 
-### [ ] M2-AUDIT-04 — Duplicate JSON object keys accepted
+### [x] M2-AUDIT-04 — Duplicate JSON object keys accepted
 
 - **Category:** HTTP / INPUT VALIDATION / HARDENING
 - **Priority:** P2 (MEDIUM / HARDENING)
-- **Status:** OPEN
+- **Status:** FIXED / CLOSED
 - **Affected Endpoint:** `POST /api/v1/ip-allocations`
 - **Problem:** Decoder parses into `map[string]json.RawMessage`, so duplicate JSON keys (e.g. `{"subnet_id": 1, "subnet_id": 2}`) are accepted with last-key-wins semantics rather than rejected.
 - **Expected Fix:** Add duplicate key detection/rejection and regression test suite.
@@ -297,7 +297,7 @@ These scenarios are statically proven safe under PostgreSQL `READ COMMITTED` iso
 
 1. `[x]` **M2-AUDIT-02** — Remove manual method check in `ListAllocations` to support HEAD requests.
 2. `[x]` **M2-AUDIT-03** — Add `http.MaxBytesReader` to reservation POST endpoint.
-3. `[ ]` **M2-AUDIT-04** — Add duplicate JSON key rejection handling.
+3. `[x]` **M2-AUDIT-04** — Add duplicate JSON key rejection handling.
 
 ### Concurrency Hardening (Test Before Merge)
 

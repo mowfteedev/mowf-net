@@ -3,7 +3,7 @@
 **Project:** MowfNet (IPAM & Network Inventory Management System)
 **Document:** Canonical Bug, Vulnerability & Hardening Tracker
 **Branch:** `feature/M2-dynamic-ip-pool`
-**Candidate SHA:** `22cca7fc61458a32161f4155e20285a31192d515`
+**Candidate SHA:** `fee6186512dcaef0141786e117e6ca7d14ae33ca`
 **Date:** 2026-08-26
 
 ---
@@ -295,8 +295,8 @@ These scenarios are statically proven safe under PostgreSQL `READ COMMITTED` iso
 
 ### High / Medium Priority (Fix Before Merge)
 
-1. `[ ]` **M2-AUDIT-02** — Remove manual method check in `ListAllocations` to support HEAD requests.
-2. `[ ]` **M2-AUDIT-03** — Add `http.MaxBytesReader` to reservation POST endpoint.
+1. `[x]` **M2-AUDIT-02** — Remove manual method check in `ListAllocations` to support HEAD requests.
+2. `[x]` **M2-AUDIT-03** — Add `http.MaxBytesReader` to reservation POST endpoint.
 3. `[ ]` **M2-AUDIT-04** — Add duplicate JSON key rejection handling.
 
 ### Concurrency Hardening (Test Before Merge)

@@ -390,6 +390,61 @@ func TestAllocationHandler_ReserveAllocationRejectsDuplicateTopLevelKeys(t *test
 	}
 }
 
+func TestAllocationHandler_ReserveAllocationAcceptsEscapedCanonicalTopLevelKeys(t *testing.T) {
+	tests := []struct {
+		name            string
+		body            string
+		rawFragment     string
+		wantDescription string
+	}{
+		{
+			name:        "address",
+			body:        `{"subnet_id":10,"\u0061ddress":"192.168.10.20"}`,
+			rawFragment: `\u0061ddress`,
+		},
+		{
+			name:        "subnet_id",
+			body:        `{"\u0073ubnet_id":10,"address":"192.168.10.20"}`,
+			rawFragment: `\u0073ubnet_id`,
+		},
+		{
+			name:            "description",
+			body:            `{"subnet_id":10,"address":"192.168.10.20","descript\u0069on":"Printer reservation"}`,
+			rawFragment:     `descript\u0069on`,
+			wantDescription: "Printer reservation",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if !strings.Contains(tc.body, tc.rawFragment) {
+				t.Fatalf("request body %q does not contain literal JSON escape %q", tc.body, tc.rawFragment)
+			}
+			beginCalls := 0
+			mux := setupSuccessfulAllocationReservationServer(t, &beginCalls)
+
+			w := httptest.NewRecorder()
+			mux.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/api/v1/ip-allocations", strings.NewReader(tc.body)))
+
+			if w.Code != http.StatusCreated {
+				t.Fatalf("status = %d, want %d; body = %s", w.Code, http.StatusCreated, w.Body.String())
+			}
+			if beginCalls != 1 {
+				t.Fatalf("BeginReservation calls = %d, want 1", beginCalls)
+			}
+			var response struct {
+				Data service.AllocationDTO `json:"data"`
+			}
+			if err := json.NewDecoder(w.Body).Decode(&response); err != nil {
+				t.Fatalf("decode response: %v", err)
+			}
+			if response.Data.SubnetID != 10 || response.Data.Address != "192.168.10.20" || response.Data.Description != tc.wantDescription {
+				t.Fatalf("response data = %#v", response.Data)
+			}
+		})
+	}
+}
+
 func TestAllocationHandler_ReserveAllocationAcceptsUniqueTopLevelKeys(t *testing.T) {
 	beginCalls := 0
 	mux := setupSuccessfulAllocationReservationServer(t, &beginCalls)

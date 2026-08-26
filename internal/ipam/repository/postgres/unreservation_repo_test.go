@@ -21,6 +21,7 @@ import (
 
 func setupUnreservationTestMux(subnetRepo *postgres.SubnetRepository, allocationRepo *postgres.AllocationRepository) *http.ServeMux {
 	mux := http.NewServeMux()
+	ipamhttp.NewSubnetHandler(service.NewSubnetService(subnetRepo)).RegisterRoutes(mux)
 	ipamhttp.NewAllocationHandler(service.NewAllocationService(allocationRepo)).RegisterRoutes(mux)
 	ipamhttp.NewAvailableIPHandler(service.NewAvailableIPService(subnetRepo, allocationRepo)).RegisterRoutes(mux)
 	return mux
@@ -42,6 +43,62 @@ func decodeAvailableIPResponse(t *testing.T, response *httptest.ResponseRecorder
 		t.Fatalf("decode available-IP response: %v", err)
 	}
 	return decoded
+}
+
+func waitForX1AdvisoryWaiter(t *testing.T, db *sql.DB, holderPID int, queryFragment string) {
+	t.Helper()
+	waitForPostgresCondition(t, fmt.Sprintf("X1 query %q waiting on advisory lock held by backend %d", queryFragment, holderPID), func() (bool, error) {
+		var waiting bool
+		err := db.QueryRow(`
+			SELECT EXISTS (
+				SELECT 1
+				FROM pg_locks waiter
+				JOIN pg_locks holder
+				  ON holder.pid = $1
+				 AND holder.locktype = 'advisory'
+				 AND holder.granted
+				 AND waiter.database IS NOT DISTINCT FROM holder.database
+				 AND waiter.classid IS NOT DISTINCT FROM holder.classid
+				 AND waiter.objid IS NOT DISTINCT FROM holder.objid
+				 AND waiter.objsubid IS NOT DISTINCT FROM holder.objsubid
+				JOIN pg_stat_activity activity ON activity.pid = waiter.pid
+				WHERE waiter.locktype = 'advisory'
+				  AND NOT waiter.granted
+				  AND waiter.pid <> holder.pid
+				  AND activity.datname = current_database()
+				  AND activity.wait_event_type = 'Lock'
+				  AND activity.wait_event = 'advisory'
+				  AND position($2 in activity.query) > 0
+			)
+		`, holderPID, queryFragment).Scan(&waiting)
+		return waiting, err
+	})
+}
+
+func receiveX1HTTPResponse(t *testing.T, description string, done <-chan *httptest.ResponseRecorder) *httptest.ResponseRecorder {
+	t.Helper()
+	select {
+	case response := <-done:
+		return response
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for %s", description)
+		return nil
+	}
+}
+
+func countX1SubnetAllocations(t *testing.T, db *sql.DB, subnetID int64) int {
+	t.Helper()
+	var subnetCount, totalCount int
+	if err := db.QueryRow(`
+		SELECT COUNT(*) FILTER (WHERE subnet_id=$1), COUNT(*)
+		FROM ip_allocations
+	`, subnetID).Scan(&subnetCount, &totalCount); err != nil {
+		t.Fatalf("count X1 subnet allocations: %v", err)
+	}
+	if subnetCount != totalCount {
+		t.Fatalf("X1 unexpected allocation rows outside subnet %d: subnet=%d total=%d", subnetID, subnetCount, totalCount)
+	}
+	return subnetCount
 }
 
 func assertSubnetIdentityUnchanged(t *testing.T, before, after *service.SubnetDTO) {
@@ -296,6 +353,207 @@ func TestAllocationUnreserveConcurrentSameAllocationSerializes(t *testing.T) {
 	if got := countAddressRows(t, db, reserved.Address); got != 0 {
 		t.Fatalf("final allocation row count = %d, want 0", got)
 	}
+}
+
+func TestM2Harden01UnreserveVsSubnetResizeDeterministicOrderings(t *testing.T) {
+	const (
+		originalCIDR = "10.136.0.0/24"
+		resizedCIDR  = "10.136.0.0/25"
+		target       = "10.136.0.200"
+	)
+
+	original, err := domain.ParseCIDR(originalCIDR)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resized, err := domain.ParseCIDR(resizedCIDR)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if usable, err := original.IsUsableIPString(target); err != nil || !usable {
+		t.Fatalf("target must be usable in original CIDR: usable=%v error=%v", usable, err)
+	}
+	if usable, err := resized.IsUsableIPString(target); err != nil || usable {
+		t.Fatalf("target must be outside resized usable range: usable=%v error=%v", usable, err)
+	}
+
+	t.Run("resize observes allocation before unreserve commit", func(t *testing.T) {
+		db := setupTestDB(t)
+		ctx := context.Background()
+		subnetRepo := postgres.NewSubnetRepository(db)
+		allocationRepo := postgres.NewAllocationRepository(db)
+		mux := setupUnreservationTestMux(subnetRepo, allocationRepo)
+		subnet := createTestSubnet(t, subnetRepo, originalCIDR, nil, "X1 uncommitted Unreserve")
+		allocationID := insertAllocation(t, db, subnet.ID, target, domain.AllocationStatusReserved, nil, "X1 boundary allocation")
+
+		pauseKey := time.Now().UnixNano()
+		if pauseKey == postgres.SubnetCoordinationKey {
+			pauseKey++
+		}
+		functionName := fmt.Sprintf("x1_pause_delete_fn_%d", pauseKey)
+		triggerName := fmt.Sprintf("x1_pause_delete_trg_%d", pauseKey)
+		if _, err := db.Exec(fmt.Sprintf(`
+			CREATE FUNCTION %s() RETURNS trigger LANGUAGE plpgsql AS $$
+			BEGIN
+				PERFORM pg_advisory_xact_lock(%d);
+				RETURN OLD;
+			END $$;
+			CREATE TRIGGER %s
+			BEFORE DELETE ON ip_allocations
+			FOR EACH ROW WHEN (OLD.id = %d)
+			EXECUTE FUNCTION %s();
+		`, functionName, pauseKey, triggerName, allocationID, functionName)); err != nil {
+			t.Fatalf("install X1 Unreserve pause trigger: %v", err)
+		}
+		t.Cleanup(func() {
+			_, _ = db.Exec(fmt.Sprintf(`
+				DROP TRIGGER IF EXISTS %s ON ip_allocations;
+				DROP FUNCTION IF EXISTS %s();
+			`, triggerName, functionName))
+		})
+
+		pauseHolder, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pauseHolderDone := false
+		t.Cleanup(func() {
+			if !pauseHolderDone {
+				_ = pauseHolder.Rollback()
+			}
+		})
+		var pauseHolderPID int
+		if err := pauseHolder.QueryRow("SELECT pg_backend_pid()").Scan(&pauseHolderPID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pauseHolder.Exec("SELECT pg_advisory_xact_lock($1)", pauseKey); err != nil {
+			t.Fatal(err)
+		}
+
+		unreserveDone := make(chan *httptest.ResponseRecorder, 1)
+		go func() {
+			unreserveDone <- serveUnreservationRequest(mux, http.MethodDelete, fmt.Sprintf("/api/v1/ip-allocations/%d", allocationID), "")
+		}()
+		waitForX1AdvisoryWaiter(t, db, pauseHolderPID, "DELETE FROM ip_allocations")
+
+		resizeDone := make(chan *httptest.ResponseRecorder, 1)
+		go func() {
+			resizeDone <- serveUnreservationRequest(mux, http.MethodPatch, fmt.Sprintf("/api/v1/subnets/%d", subnet.ID), fmt.Sprintf(`{"cidr":%q}`, resizedCIDR))
+		}()
+		resizeResponse := receiveX1HTTPResponse(t, "Resize conflict before releasing Unreserve", resizeDone)
+		if resizeResponse.Code != http.StatusConflict {
+			t.Fatalf("Resize status/body = %d/%s, want 409", resizeResponse.Code, resizeResponse.Body.String())
+		}
+		var conflict ipamhttp.ErrorResponse
+		if err := json.NewDecoder(resizeResponse.Body).Decode(&conflict); err != nil || conflict.Error.Code != "SUBNET_RESIZE_CONFLICT" {
+			t.Fatalf("Resize conflict response = %#v, decode error = %v", conflict, err)
+		}
+		whilePaused, err := subnetRepo.GetByID(ctx, subnet.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if whilePaused.CIDR.CIDR() != originalCIDR || whilePaused.ReservedCount != 1 || countX1SubnetAllocations(t, db, subnet.ID) != 1 {
+			t.Fatalf("state while Unreserve paused = cidr:%s reserved:%d rows:%d", whilePaused.CIDR.CIDR(), whilePaused.ReservedCount, countX1SubnetAllocations(t, db, subnet.ID))
+		}
+		select {
+		case response := <-unreserveDone:
+			t.Fatalf("Unreserve completed before pause release: status=%d body=%s", response.Code, response.Body.String())
+		default:
+		}
+
+		if err := pauseHolder.Commit(); err != nil {
+			t.Fatal(err)
+		}
+		pauseHolderDone = true
+		unreserveResponse := receiveX1HTTPResponse(t, "Unreserve after pause release", unreserveDone)
+		if unreserveResponse.Code != http.StatusNoContent || unreserveResponse.Body.Len() != 0 {
+			t.Fatalf("Unreserve status/body = %d/%q, want 204/empty", unreserveResponse.Code, unreserveResponse.Body.String())
+		}
+		finalState, err := subnetRepo.GetByID(ctx, subnet.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if finalState.CIDR.CIDR() != originalCIDR || finalState.ReservedCount != 0 || countX1SubnetAllocations(t, db, subnet.ID) != 0 || countAddressRows(t, db, target) != 0 {
+			t.Fatalf("final state = cidr:%s reserved:%d rows:%d target_rows:%d", finalState.CIDR.CIDR(), finalState.ReservedCount, countX1SubnetAllocations(t, db, subnet.ID), countAddressRows(t, db, target))
+		}
+	})
+
+	t.Run("unreserve commits before resize scan", func(t *testing.T) {
+		db := setupTestDB(t)
+		ctx := context.Background()
+		subnetRepo := postgres.NewSubnetRepository(db)
+		allocationRepo := postgres.NewAllocationRepository(db)
+		mux := setupUnreservationTestMux(subnetRepo, allocationRepo)
+		subnet := createTestSubnet(t, subnetRepo, originalCIDR, nil, "X1 committed Unreserve")
+		allocationID := insertAllocation(t, db, subnet.ID, target, domain.AllocationStatusReserved, nil, "X1 boundary allocation")
+
+		coordinationHolder, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		coordinationHolderDone := false
+		t.Cleanup(func() {
+			if !coordinationHolderDone {
+				_ = coordinationHolder.Rollback()
+			}
+		})
+		var coordinationHolderPID int
+		if err := coordinationHolder.QueryRow("SELECT pg_backend_pid()").Scan(&coordinationHolderPID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := coordinationHolder.Exec("SELECT pg_advisory_xact_lock($1)", postgres.SubnetCoordinationKey); err != nil {
+			t.Fatal(err)
+		}
+
+		resizeDone := make(chan *httptest.ResponseRecorder, 1)
+		go func() {
+			resizeDone <- serveUnreservationRequest(mux, http.MethodPatch, fmt.Sprintf("/api/v1/subnets/%d", subnet.ID), fmt.Sprintf(`{"cidr":%q}`, resizedCIDR))
+		}()
+		waitForX1AdvisoryWaiter(t, db, coordinationHolderPID, "pg_advisory_xact_lock")
+		select {
+		case response := <-resizeDone:
+			t.Fatalf("Resize completed before coordination lock release: status=%d body=%s", response.Code, response.Body.String())
+		default:
+		}
+
+		unreserveResponse := serveUnreservationRequest(mux, http.MethodDelete, fmt.Sprintf("/api/v1/ip-allocations/%d", allocationID), "")
+		if unreserveResponse.Code != http.StatusNoContent || unreserveResponse.Body.Len() != 0 {
+			t.Fatalf("Unreserve status/body = %d/%q, want 204/empty", unreserveResponse.Code, unreserveResponse.Body.String())
+		}
+		if countX1SubnetAllocations(t, db, subnet.ID) != 0 || countAddressRows(t, db, target) != 0 {
+			t.Fatalf("Unreserve was not committed before release: rows=%d target_rows=%d", countX1SubnetAllocations(t, db, subnet.ID), countAddressRows(t, db, target))
+		}
+		select {
+		case response := <-resizeDone:
+			t.Fatalf("Resize completed while coordination lock remained held: status=%d body=%s", response.Code, response.Body.String())
+		default:
+		}
+
+		if err := coordinationHolder.Commit(); err != nil {
+			t.Fatal(err)
+		}
+		coordinationHolderDone = true
+		resizeResponse := receiveX1HTTPResponse(t, "Resize after committed Unreserve", resizeDone)
+		if resizeResponse.Code != http.StatusOK {
+			t.Fatalf("Resize status/body = %d/%s, want 200", resizeResponse.Code, resizeResponse.Body.String())
+		}
+		var resizedResponse struct {
+			Data service.SubnetDTO `json:"data"`
+		}
+		if err := json.NewDecoder(resizeResponse.Body).Decode(&resizedResponse); err != nil {
+			t.Fatalf("decode successful Resize response: %v", err)
+		}
+		if resizedResponse.Data.ID != subnet.ID || resizedResponse.Data.CIDR != resizedCIDR || resizedResponse.Data.ReservedCount != 0 {
+			t.Fatalf("successful Resize response = %+v", resizedResponse.Data)
+		}
+		finalState, err := subnetRepo.GetByID(ctx, subnet.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if finalState.CIDR.CIDR() != resizedCIDR || finalState.ReservedCount != 0 || countX1SubnetAllocations(t, db, subnet.ID) != 0 || countAddressRows(t, db, target) != 0 {
+			t.Fatalf("final state = cidr:%s reserved:%d rows:%d target_rows:%d", finalState.CIDR.CIDR(), finalState.ReservedCount, countX1SubnetAllocations(t, db, subnet.ID), countAddressRows(t, db, target))
+		}
+	})
 }
 
 func TestAllocationUnreserveDoesNotUseSubnetOrAdvisoryLock(t *testing.T) {

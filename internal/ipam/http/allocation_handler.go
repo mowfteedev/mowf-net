@@ -63,11 +63,6 @@ func (h *AllocationHandler) UnreserveAllocation(w http.ResponseWriter, r *http.R
 
 // ListAllocations handles GET /api/v1/ip-allocations.
 func (h *AllocationHandler) ListAllocations(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
 	req, err := parseAllocationListRequest(r)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "INVALID_REQUEST", "Invalid request parameters")

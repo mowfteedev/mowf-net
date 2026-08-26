@@ -104,6 +104,24 @@ func setupAllocationTestServer(repo *mockAllocationRepo) *http.ServeMux {
 	return mux
 }
 
+func TestAllocationHandler_ListAllocations_HEADAcceptedThroughServeMux(t *testing.T) {
+	listCalled := false
+	mux := setupAllocationTestServer(&mockAllocationRepo{listFn: func(_ context.Context, _ repository.AllocationListFilter) ([]*domain.Allocation, *int64, error) {
+		listCalled = true
+		return nil, nil, nil
+	}})
+
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, httptest.NewRequest(http.MethodHead, "/api/v1/ip-allocations", nil))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body = %s", w.Code, http.StatusOK, w.Body.String())
+	}
+	if !listCalled {
+		t.Fatal("list repository path was not reached")
+	}
+}
+
 func TestAllocationHandler_ListAllocations_ReturnsPersistedRowsAndFilters(t *testing.T) {
 	interfaceID := int64(9)
 	var gotFilter repository.AllocationListFilter

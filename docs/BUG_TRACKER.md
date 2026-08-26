@@ -35,10 +35,10 @@ P5 = INFO       (architectural observation or performance note with no correctne
 | **M1 Historical Findings** | 8 | 8 | 0 | 0 |
 | **M1 Hardening & Debt** | 3 | 0 | 3 | 0 |
 | **M2 Historical & Protected** | 10 | 10 | 0 | 0 |
-| **M2 Audit Findings** | 4 | 0 | 3 | 1 |
+| **M2 Audit Findings** | 4 | 1 | 2 | 1 |
 | **M2 Concurrency Hardening** | 3 | 0 | 3 | 0 |
 | **M2 Info / Observations** | 1 | 0 | 1 | 0 |
-| **Total** | **29** | **18** | **10** | **1** |
+| **Total** | **29** | **19** | **9** | **1** |
 
 ---
 
@@ -218,11 +218,11 @@ P5 = INFO       (architectural observation or performance note with no correctne
   - M2 does not implement Assign/Unassign, Devices, Interfaces, or `device_interfaces` table.
   - **Decision:** Not an M2 merge blocker. New migration `000004` and constraints will be added in M4 when Interface assignment workflows are created. Existing migration `000003` must not be modified.
 
-### [ ] M2-AUDIT-02 — HEAD `/api/v1/ip-allocations` rejected with 405
+### [x] M2-AUDIT-02 — HEAD `/api/v1/ip-allocations` rejected with 405
 
 - **Category:** HTTP / API CONTRACT
 - **Priority:** P2 (MEDIUM)
-- **Status:** OPEN
+- **Status:** FIXED / CLOSED
 - **Affected File:** `internal/ipam/http/allocation_handler.go`
 - **Problem:** Route uses Go 1.22+ pattern `GET /api/v1/ip-allocations`, which routes both GET and HEAD. `ListAllocations` contains a redundant manual `r.Method != http.MethodGet` guard, causing HEAD requests to be rejected with `405 Method Not Allowed`.
 - **Expected Fix:** Remove redundant manual method guard and add HEAD regression test.

@@ -3,7 +3,7 @@
 **Project:** MowfNet (IPAM & Network Inventory Management System)
 **Document:** Canonical Bug, Vulnerability & Hardening Tracker
 **Branch:** `feature/M2-dynamic-ip-pool`
-**Candidate SHA:** `fee6186512dcaef0141786e117e6ca7d14ae33ca`
+**Candidate SHA:** `59dcc1a5e1435903222c2b4078bf4384b72b250d`
 **Date:** 2026-08-26
 
 ---
@@ -36,9 +36,10 @@ P5 = INFO       (architectural observation or performance note with no correctne
 | **M1 Hardening & Debt** | 3 | 0 | 3 | 0 |
 | **M2 Historical & Protected** | 10 | 10 | 0 | 0 |
 | **M2 Audit Findings** | 4 | 3 | 0 | 1 |
-| **M2 Concurrency Hardening** | 3 | 0 | 3 | 0 |
+| **M2 Concurrency Hardening** | 3 | 1 | 2 | 0 |
+| **M2 Test Harness Hardening** | 1 | 0 | 1 | 0 |
 | **M2 Info / Observations** | 1 | 0 | 1 | 0 |
-| **Total** | **29** | **21** | **7** | **1** |
+| **Total** | **30** | **22** | **7** | **1** |
 
 ---
 
@@ -251,14 +252,17 @@ P5 = INFO       (architectural observation or performance note with no correctne
 
 These scenarios are statically proven safe under PostgreSQL `READ COMMITTED` isolation, but dedicated deterministic runtime barrier tests are recommended.
 
-### [ ] M2-HARDEN-01 — X1: Unreserve vs Resize deterministic coverage
+### [x] M2-HARDEN-01 — X1: Unreserve vs Resize deterministic coverage
 
 - **Category:** CONCURRENCY / HARDENING
 - **Priority:** P4
-- **Status:** OPEN
+- **Status:** CLOSED / VERIFIED
+- **Evidence Commit:** `59dcc1a5e1435903222c2b4078bf4384b72b250d` (`test(ipam): cover unreserve resize ordering`)
 - **Scenario:** Concurrent `Unreserve(allocation_id)` and Subnet `Resize` shrinking CIDR below target address.
 - **Static Analysis:** Proven safe. Resize sees allocation before Unreserve commit -> returns `409 SUBNET_RESIZE_CONFLICT`; or Unreserve commits first -> allocation deleted -> Resize proceeds cleanly. No orphan allocation possible.
-- **Required Action:** Add deterministic trigger-paused concurrency test verifying both execution orderings.
+- **Verification Evidence:** Deterministic PostgreSQL runtime test coverage proves both execution orderings via exact PostgreSQL advisory lock waiter observation (`pg_locks`), race verification (`-race`), 20/20 repeatability, and persisted-state verification:
+  - **ORDERING A:** Unreserve `DELETE` remains uncommitted → Resize sees committed allocation → `409 SUBNET_RESIZE_CONFLICT` → Unreserve later `204` → final old CIDR, zero allocation rows.
+  - **ORDERING B:** Resize waits before scan on `SubnetCoordinationKey` → Unreserve commits `204` → allocation absent → Resize resumes `200` → final resized CIDR, zero allocation rows.
 
 ### [ ] M2-HARDEN-02 — X2: Unreserve vs Subnet Delete deterministic coverage
 
@@ -280,7 +284,24 @@ These scenarios are statically proven safe under PostgreSQL `READ COMMITTED` iso
 
 ---
 
-## 8. M2 — Info & Performance Observations
+## 8. M2 — Test Harness Hardening
+
+### [ ] M2-TEST-HARDEN-01 — TestMain early temp-dir cleanup
+
+- **Category:** TEST HARNESS / CLEANUP / HARDENING
+- **Priority:** P4
+- **Status:** OPEN / NON-BLOCKING
+- **Summary:** If `acquireFreePort()` fails after `MkdirTemp()` succeeds, the temporary embedded-PostgreSQL directory can be left behind because `TestMain` exits before normal cleanup.
+- **Expected Fix:** Ensure `tempDir` cleanup is registered/guaranteed immediately after successful `MkdirTemp`, including early setup failures.
+- **Impact Assessment:**
+  - No production impact (test harness only).
+  - No X1 correctness impact.
+  - Does not block continuing X2/X3.
+  - Can be handled in test-harness cleanup.
+
+---
+
+## 9. M2 — Info & Performance Observations
 
 ### [ ] M2-INFO-01 — AvailableIPService Subnet read also calculates allocation counts
 
@@ -291,7 +312,7 @@ These scenarios are statically proven safe under PostgreSQL `READ COMMITTED` iso
 
 ---
 
-## 9. Actionable Pre-Merge Queue
+## 10. Actionable Pre-Merge Queue
 
 ### High / Medium Priority (Fix Before Merge)
 
@@ -301,9 +322,13 @@ These scenarios are statically proven safe under PostgreSQL `READ COMMITTED` iso
 
 ### Concurrency Hardening (Test Before Merge)
 
-4. `[ ]` **M2-HARDEN-01** — X1 Unreserve vs Resize deterministic test.
+4. `[x]` **M2-HARDEN-01** — X1 Unreserve vs Resize deterministic test.
 5. `[ ]` **M2-HARDEN-02** — X2 Unreserve vs Subnet Delete deterministic test.
 6. `[ ]` **M2-HARDEN-03** — X3 Reserve vs Unreserve same-address deterministic test.
+
+### Test Harness Hardening (Non-Blocking)
+
+- `[ ]` **M2-TEST-HARDEN-01** — TestMain early temp-dir cleanup (P4; non-blocking for X2/X3).
 
 ### Deferred (Post-M2 Roadmap)
 

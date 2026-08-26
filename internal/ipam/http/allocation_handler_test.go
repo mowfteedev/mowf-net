@@ -104,6 +104,57 @@ func setupAllocationTestServer(repo *mockAllocationRepo) *http.ServeMux {
 	return mux
 }
 
+func setupSuccessfulAllocationReservationServer(t *testing.T, beginCalls *int) *http.ServeMux {
+	t.Helper()
+	cidr := mustHTTPTestCIDR(t, "192.168.10.0/24")
+	tx := &mockReservationTransaction{
+		lockFn: func(_ context.Context, subnetID int64) (domain.CIDR, error) {
+			if subnetID != 10 {
+				t.Fatalf("subnet ID = %d, want 10", subnetID)
+			}
+			return cidr, nil
+		},
+		insertFn: func(_ context.Context, allocation *domain.Allocation) error {
+			allocation.ID = 100
+			return nil
+		},
+		commitFn:   func() error { return nil },
+		rollbackFn: func() error { return nil },
+	}
+	return setupAllocationTestServer(&mockAllocationRepo{beginFn: func(context.Context) (repository.AllocationReservationTransaction, error) {
+		(*beginCalls)++
+		return tx, nil
+	}})
+}
+
+func reserveAllocationRequestBody(t *testing.T, size int) string {
+	t.Helper()
+	const prefix = `{"subnet_id":10,"address":"192.168.10.20","description":"`
+	const suffix = `"}`
+	if size < len(prefix)+len(suffix) {
+		t.Fatalf("requested body size %d is too small", size)
+	}
+	body := prefix + strings.Repeat("a", size-len(prefix)-len(suffix)) + suffix
+	if len(body) != size {
+		t.Fatalf("body size = %d, want %d", len(body), size)
+	}
+	return body
+}
+
+func assertReserveAllocationInvalidRequest(t *testing.T, w *httptest.ResponseRecorder) {
+	t.Helper()
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body = %s", w.Code, http.StatusBadRequest, w.Body.String())
+	}
+	var response ipamhttp.ErrorResponse
+	if err := json.NewDecoder(w.Body).Decode(&response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response.Error.Code != "INVALID_REQUEST" || response.Error.Message != "Invalid request payload" {
+		t.Fatalf("error response = %#v", response.Error)
+	}
+}
+
 func TestAllocationHandler_ListAllocations_HEADAcceptedThroughServeMux(t *testing.T) {
 	listCalled := false
 	mux := setupAllocationTestServer(&mockAllocationRepo{listFn: func(_ context.Context, _ repository.AllocationListFilter) ([]*domain.Allocation, *int64, error) {
@@ -277,6 +328,72 @@ func TestAllocationHandler_ReserveAllocationCreatedAndDescriptionDefaults(t *tes
 				t.Fatalf("response data = %#v", response.Data)
 			}
 		})
+	}
+}
+
+func TestAllocationHandler_ReserveAllocationRejectsOversizedValidLookingPayload(t *testing.T) {
+	beginCalls := 0
+	mux := setupSuccessfulAllocationReservationServer(t, &beginCalls)
+	body := reserveAllocationRequestBody(t, 16*1024+64)
+
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/api/v1/ip-allocations", strings.NewReader(body)))
+
+	assertReserveAllocationInvalidRequest(t, w)
+	if beginCalls != 0 {
+		t.Fatalf("BeginReservation calls = %d, want 0", beginCalls)
+	}
+}
+
+func TestAllocationHandler_ReserveAllocationRejectsOversizedPayloadWithUnknownContentLength(t *testing.T) {
+	beginCalls := 0
+	mux := setupSuccessfulAllocationReservationServer(t, &beginCalls)
+	body := reserveAllocationRequestBody(t, 16*1024+64)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/ip-allocations", strings.NewReader(body))
+	req.ContentLength = -1
+
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	assertReserveAllocationInvalidRequest(t, w)
+	if beginCalls != 0 {
+		t.Fatalf("BeginReservation calls = %d, want 0", beginCalls)
+	}
+}
+
+func TestAllocationHandler_ReserveAllocationAcceptsExactRequestBodyLimit(t *testing.T) {
+	beginCalls := 0
+	mux := setupSuccessfulAllocationReservationServer(t, &beginCalls)
+	body := reserveAllocationRequestBody(t, 16*1024)
+	if len(body) != 16384 {
+		t.Fatalf("body size = %d, want 16384", len(body))
+	}
+
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/api/v1/ip-allocations", strings.NewReader(body)))
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d; body = %s", w.Code, http.StatusCreated, w.Body.String())
+	}
+	if beginCalls != 1 {
+		t.Fatalf("BeginReservation calls = %d, want 1", beginCalls)
+	}
+}
+
+func TestAllocationHandler_ReserveAllocationRejectsOneByteAboveRequestBodyLimit(t *testing.T) {
+	beginCalls := 0
+	mux := setupSuccessfulAllocationReservationServer(t, &beginCalls)
+	body := reserveAllocationRequestBody(t, 16*1024+1)
+	if len(body) != 16385 {
+		t.Fatalf("body size = %d, want 16385", len(body))
+	}
+
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/api/v1/ip-allocations", strings.NewReader(body)))
+
+	assertReserveAllocationInvalidRequest(t, w)
+	if beginCalls != 0 {
+		t.Fatalf("BeginReservation calls = %d, want 0", beginCalls)
 	}
 }
 

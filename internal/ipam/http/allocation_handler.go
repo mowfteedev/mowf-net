@@ -19,6 +19,8 @@ type AllocationHandler struct {
 	service *service.AllocationService
 }
 
+const maxReserveAllocationRequestBodyBytes int64 = 16 * 1024
+
 func NewAllocationHandler(service *service.AllocationService) *AllocationHandler {
 	return &AllocationHandler{service: service}
 }
@@ -32,7 +34,7 @@ func (h *AllocationHandler) RegisterRoutes(mux *http.ServeMux) {
 
 // ReserveAllocation handles POST /api/v1/ip-allocations.
 func (h *AllocationHandler) ReserveAllocation(w http.ResponseWriter, r *http.Request) {
-	req, err := decodeReserveAllocationRequest(r.Body)
+	req, err := decodeReserveAllocationRequest(http.MaxBytesReader(w, r.Body, maxReserveAllocationRequestBodyBytes))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "INVALID_REQUEST", "Invalid request payload")
 		return

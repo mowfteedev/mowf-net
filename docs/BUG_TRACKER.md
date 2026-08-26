@@ -35,10 +35,10 @@ P5 = INFO       (architectural observation or performance note with no correctne
 | **M1 Historical Findings** | 8 | 8 | 0 | 0 |
 | **M1 Hardening & Debt** | 3 | 0 | 3 | 0 |
 | **M2 Historical & Protected** | 10 | 10 | 0 | 0 |
-| **M2 Audit Findings** | 4 | 1 | 2 | 1 |
+| **M2 Audit Findings** | 4 | 2 | 1 | 1 |
 | **M2 Concurrency Hardening** | 3 | 0 | 3 | 0 |
 | **M2 Info / Observations** | 1 | 0 | 1 | 0 |
-| **Total** | **29** | **19** | **9** | **1** |
+| **Total** | **29** | **20** | **8** | **1** |
 
 ---
 
@@ -227,11 +227,11 @@ P5 = INFO       (architectural observation or performance note with no correctne
 - **Problem:** Route uses Go 1.22+ pattern `GET /api/v1/ip-allocations`, which routes both GET and HEAD. `ListAllocations` contains a redundant manual `r.Method != http.MethodGet` guard, causing HEAD requests to be rejected with `405 Method Not Allowed`.
 - **Expected Fix:** Remove redundant manual method guard and add HEAD regression test.
 
-### [ ] M2-AUDIT-03 — Reservation POST body has no explicit size bound
+### [x] M2-AUDIT-03 — Reservation POST body has no explicit size bound
 
 - **Category:** HTTP / SECURITY / RESOURCE ROBUSTNESS
 - **Priority:** P2 (MEDIUM)
-- **Status:** OPEN
+- **Status:** FIXED / CLOSED
 - **Affected Endpoint:** `POST /api/v1/ip-allocations`
 - **Problem:** Request body reaches `json.NewDecoder` without explicit size bounding (e.g. `http.MaxBytesReader`), creating potential memory exhaustion risk on oversized payloads.
 - **Expected Fix:** Wrap `r.Body` with `http.MaxBytesReader` appropriate for reservation payloads and add oversized-payload regression test.

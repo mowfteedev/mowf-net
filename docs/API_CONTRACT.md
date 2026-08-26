@@ -427,6 +427,10 @@ Request:
 }
 ```
 
+Maximum request body size: `16384 bytes`.
+
+A request body larger than `16384 bytes` is rejected with `400 INVALID_REQUEST` before any reservation transaction begins.
+
 Success:
 
 - `201`, status=`reserved`, `interface_id=null`.

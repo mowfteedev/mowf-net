@@ -3,7 +3,7 @@
 **Project:** MowfNet (IPAM & Network Inventory Management System)
 **Document:** Canonical Bug, Vulnerability & Hardening Tracker
 **Branch:** `feature/M2-dynamic-ip-pool`
-**Candidate SHA:** `59dcc1a5e1435903222c2b4078bf4384b72b250d`
+**Candidate SHA:** `e9bedc95e751b65bb7db3989c6ea37d0ad20cfd1`
 **Date:** 2026-08-26
 
 ---
@@ -36,10 +36,10 @@ P5 = INFO       (architectural observation or performance note with no correctne
 | **M1 Hardening & Debt** | 3 | 0 | 3 | 0 |
 | **M2 Historical & Protected** | 10 | 10 | 0 | 0 |
 | **M2 Audit Findings** | 4 | 3 | 0 | 1 |
-| **M2 Concurrency Hardening** | 3 | 1 | 2 | 0 |
+| **M2 Concurrency Hardening** | 3 | 2 | 1 | 0 |
 | **M2 Test Harness Hardening** | 1 | 0 | 1 | 0 |
 | **M2 Info / Observations** | 1 | 0 | 1 | 0 |
-| **Total** | **30** | **22** | **7** | **1** |
+| **Total** | **30** | **23** | **6** | **1** |
 
 ---
 
@@ -264,14 +264,17 @@ These scenarios are statically proven safe under PostgreSQL `READ COMMITTED` iso
   - **ORDERING A:** Unreserve `DELETE` remains uncommitted → Resize sees committed allocation → `409 SUBNET_RESIZE_CONFLICT` → Unreserve later `204` → final old CIDR, zero allocation rows.
   - **ORDERING B:** Resize waits before scan on `SubnetCoordinationKey` → Unreserve commits `204` → allocation absent → Resize resumes `200` → final resized CIDR, zero allocation rows.
 
-### [ ] M2-HARDEN-02 — X2: Unreserve vs Subnet Delete deterministic coverage
+### [x] M2-HARDEN-02 — X2: Unreserve vs Subnet Delete deterministic coverage
 
 - **Category:** CONCURRENCY / DATABASE / HARDENING
 - **Priority:** P4
-- **Status:** OPEN
+- **Status:** CLOSED / VERIFIED
+- **Evidence Commit:** `e9bedc95e751b65bb7db3989c6ea37d0ad20cfd1` (`test(ipam): cover unreserve subnet delete ordering`)
 - **Scenario:** Concurrent `Unreserve(allocation_id)` and `DeleteSubnet(subnet_id)`.
 - **Static Analysis:** Proven safe. Delete holds `subnets FOR UPDATE` and checks `EXISTS`. `ip_allocations_subnet_id_fkey ON DELETE RESTRICT` protects integrity. No orphan possible.
-- **Required Action:** Add deterministic trigger-paused concurrency test verifying clean deletion / conservative conflict.
+- **Verification Evidence:** Deterministic PostgreSQL barrier coverage verified exact holder/waiter behavior, READ COMMITTED statement snapshots, the active immediate `ON DELETE RESTRICT` FK, persisted HTTP/DB state, and absence of orphan allocations. Focused repeatability passed 20/20; race coverage passed 5/5.
+  - **ORDERING A:** Unreserve child DELETE remains uncommitted → Subnet Delete sees committed child → `409 SUBNET_HAS_ALLOCATIONS` → parent remains → Unreserve later commits `204` → final parent exists, child absent.
+  - **ORDERING B:** Subnet Delete waits on parent `FOR UPDATE` → Unreserve commits `204` → child deletion becomes visible → Delete resumes with a fresh READ COMMITTED statement snapshot → parent Delete returns `204` → final parent absent, child absent.
 
 ### [ ] M2-HARDEN-03 — X3: Reserve vs Unreserve same address deterministic coverage
 
@@ -323,7 +326,7 @@ These scenarios are statically proven safe under PostgreSQL `READ COMMITTED` iso
 ### Concurrency Hardening (Test Before Merge)
 
 4. `[x]` **M2-HARDEN-01** — X1 Unreserve vs Resize deterministic test.
-5. `[ ]` **M2-HARDEN-02** — X2 Unreserve vs Subnet Delete deterministic test.
+5. `[x]` **M2-HARDEN-02** — X2 Unreserve vs Subnet Delete deterministic test.
 6. `[ ]` **M2-HARDEN-03** — X3 Reserve vs Unreserve same-address deterministic test.
 
 ### Test Harness Hardening (Non-Blocking)

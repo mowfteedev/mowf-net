@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mowfteedev/mowf-net/internal/ipam/domain"
 	ipamhttp "github.com/mowfteedev/mowf-net/internal/ipam/http"
@@ -44,6 +45,425 @@ func countAddressRows(t *testing.T, db *sql.DB, address string) int {
 		t.Fatalf("failed to count allocation address %s: %v", address, err)
 	}
 	return count
+}
+
+type x3DeleteBarrier struct {
+	holder      *sql.Tx
+	holderPID   int
+	pauseKey    int64
+	triggerName string
+	released    bool
+}
+
+type x3InsertWaitEvidence struct {
+	PID                int
+	WaitEvent          string
+	UngrantedLockTypes string
+	BlockingPIDs       string
+}
+
+func assertX3UniqueAddressConstraint(t *testing.T, db *sql.DB) {
+	t.Helper()
+	var count int
+	if err := db.QueryRow(`
+		SELECT COUNT(*)
+		FROM pg_constraint constraint_record
+		JOIN pg_class table_record ON table_record.oid = constraint_record.conrelid
+		JOIN pg_index index_record ON index_record.indexrelid = constraint_record.conindid
+		WHERE table_record.oid = 'ip_allocations'::regclass
+		  AND constraint_record.conname = 'ip_allocations_address_uq'
+		  AND constraint_record.contype = 'u'
+		  AND NOT constraint_record.condeferrable
+		  AND constraint_record.convalidated
+		  AND index_record.indisunique
+		  AND index_record.indisvalid
+		  AND index_record.indisready
+		  AND pg_get_constraintdef(constraint_record.oid) = 'UNIQUE (address)'
+	`).Scan(&count); err != nil {
+		t.Fatalf("inspect X3 UNIQUE(address) authority: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("active ip_allocations_address_uq UNIQUE(address) constraint count = %d, want 1", count)
+	}
+}
+
+func installX3AfterDeleteBarrier(t *testing.T, db *sql.DB, allocationID int64, forceRollback bool) *x3DeleteBarrier {
+	t.Helper()
+	nonce := time.Now().UnixNano()
+	mode := "commit"
+	afterWait := "RETURN OLD;"
+	if forceRollback {
+		mode = "rollback"
+		afterWait = "RAISE EXCEPTION 'M2-HARDEN-03 X3 forced rollback after DELETE'; RETURN OLD;"
+	}
+	functionName := fmt.Sprintf("x3_after_delete_%s_fn_%d", mode, nonce)
+	triggerName := fmt.Sprintf("x3_after_delete_%s_trg_%d", mode, nonce)
+	pauseKey := -nonce
+
+	if _, err := db.Exec(fmt.Sprintf(`
+		CREATE FUNCTION %s() RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN
+			PERFORM pg_advisory_xact_lock(%d);
+			%s
+		END $$;
+		CREATE TRIGGER %s
+		AFTER DELETE ON ip_allocations
+		FOR EACH ROW WHEN (OLD.id = %d)
+		EXECUTE FUNCTION %s();
+	`, functionName, pauseKey, afterWait, triggerName, allocationID, functionName)); err != nil {
+		t.Fatalf("install X3 AFTER DELETE barrier: %v", err)
+	}
+	t.Cleanup(func() {
+		if _, err := db.Exec(fmt.Sprintf(`
+			DROP TRIGGER IF EXISTS %s ON ip_allocations;
+			DROP FUNCTION IF EXISTS %s();
+		`, triggerName, functionName)); err != nil {
+			t.Errorf("clean up X3 AFTER DELETE barrier: %v", err)
+		}
+	})
+
+	var triggerCount int
+	if err := db.QueryRow(`
+		SELECT COUNT(*)
+		FROM pg_trigger trigger_record
+		WHERE trigger_record.tgrelid = 'ip_allocations'::regclass
+		  AND trigger_record.tgname = $1
+		  AND NOT trigger_record.tgisinternal
+		  AND trigger_record.tgenabled <> 'D'
+		  AND (trigger_record.tgtype::integer & 1) = 1
+		  AND (trigger_record.tgtype::integer & 2) = 0
+		  AND (trigger_record.tgtype::integer & 8) = 8
+		  AND (trigger_record.tgtype::integer & (4 | 16 | 32 | 64)) = 0
+		  AND position($2 in pg_get_expr(trigger_record.tgqual, trigger_record.tgrelid)) > 0
+	`, triggerName, fmt.Sprint(allocationID)).Scan(&triggerCount); err != nil {
+		t.Fatalf("inspect X3 AFTER DELETE barrier: %v", err)
+	}
+	if triggerCount != 1 {
+		t.Fatalf("enabled exact-row AFTER DELETE trigger count = %d, want 1", triggerCount)
+	}
+
+	holder, err := db.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("begin X3 advisory holder: %v", err)
+	}
+	barrier := &x3DeleteBarrier{
+		holder:      holder,
+		pauseKey:    pauseKey,
+		triggerName: triggerName,
+	}
+	t.Cleanup(func() {
+		if !barrier.released {
+			if err := barrier.holder.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+				t.Errorf("roll back X3 advisory holder: %v", err)
+			}
+		}
+	})
+	if err := holder.QueryRow("SELECT pg_backend_pid()").Scan(&barrier.holderPID); err != nil {
+		t.Fatalf("read X3 advisory holder PID: %v", err)
+	}
+	if _, err := holder.Exec("SELECT pg_advisory_xact_lock($1)", pauseKey); err != nil {
+		t.Fatalf("acquire X3 advisory barrier: %v", err)
+	}
+	return barrier
+}
+
+func (barrier *x3DeleteBarrier) release(t *testing.T) {
+	t.Helper()
+	if err := barrier.holder.Commit(); err != nil {
+		t.Fatalf("release X3 advisory barrier: %v", err)
+	}
+	barrier.released = true
+}
+
+func waitForX3AdvisoryWaiterPID(t *testing.T, db *sql.DB, holderPID int) int {
+	t.Helper()
+	var unreservePID int
+	waitForPostgresCondition(t, fmt.Sprintf("X3 production DELETE waiting on AFTER DELETE advisory holder %d", holderPID), func() (bool, error) {
+		var observedPID int
+		err := db.QueryRow(`
+			SELECT activity.pid
+			FROM pg_locks waiter
+			JOIN pg_locks holder
+			  ON holder.pid = $1
+			 AND holder.locktype = 'advisory'
+			 AND holder.granted
+			 AND waiter.database IS NOT DISTINCT FROM holder.database
+			 AND waiter.classid IS NOT DISTINCT FROM holder.classid
+			 AND waiter.objid IS NOT DISTINCT FROM holder.objid
+			 AND waiter.objsubid IS NOT DISTINCT FROM holder.objsubid
+			JOIN pg_stat_activity activity ON activity.pid = waiter.pid
+			JOIN pg_stat_activity holder_activity ON holder_activity.pid = holder.pid
+			WHERE waiter.locktype = 'advisory'
+			  AND NOT waiter.granted
+			  AND waiter.pid <> holder.pid
+			  AND activity.datname = current_database()
+			  AND holder_activity.datname = current_database()
+			  AND activity.state = 'active'
+			  AND activity.wait_event_type = 'Lock'
+			  AND activity.wait_event = 'advisory'
+			  AND holder.pid = ANY(pg_blocking_pids(activity.pid))
+			  AND position('DELETE FROM ip_allocations' in activity.query) > 0
+			ORDER BY activity.pid
+			LIMIT 1
+		`, holderPID).Scan(&observedPID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		unreservePID = observedPID
+		return true, nil
+	})
+	return unreservePID
+}
+
+func waitForX3InsertBlockedByPID(t *testing.T, db *sql.DB, unreservePID int) x3InsertWaitEvidence {
+	t.Helper()
+	var evidence x3InsertWaitEvidence
+	waitForPostgresCondition(t, fmt.Sprintf("X3 production INSERT blocked by Unreserve backend %d", unreservePID), func() (bool, error) {
+		var observed x3InsertWaitEvidence
+		err := db.QueryRow(`
+			SELECT activity.pid,
+			       activity.wait_event,
+			       COALESCE((
+			           SELECT string_agg(DISTINCT waiting_lock.locktype, ',' ORDER BY waiting_lock.locktype)
+			           FROM pg_locks waiting_lock
+			           WHERE waiting_lock.pid = activity.pid
+			             AND NOT waiting_lock.granted
+			       ), ''),
+			       array_to_string(pg_blocking_pids(activity.pid), ',')
+			FROM pg_stat_activity activity
+			JOIN pg_stat_activity blocker
+			  ON blocker.pid = $1
+			 AND blocker.datname = current_database()
+			WHERE activity.pid <> blocker.pid
+			  AND activity.datname = current_database()
+			  AND activity.state = 'active'
+			  AND activity.wait_event_type = 'Lock'
+			  AND blocker.state = 'active'
+			  AND blocker.wait_event_type = 'Lock'
+			  AND blocker.wait_event = 'advisory'
+			  AND blocker.pid = ANY(pg_blocking_pids(activity.pid))
+			  AND position('INSERT INTO ip_allocations' in activity.query) > 0
+			ORDER BY activity.pid
+			LIMIT 1
+		`, unreservePID).Scan(&observed.PID, &observed.WaitEvent, &observed.UngrantedLockTypes, &observed.BlockingPIDs)
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		evidence = observed
+		return true, nil
+	})
+	return evidence
+}
+
+func assertX3HTTPPending(t *testing.T, description string, done <-chan *httptest.ResponseRecorder) {
+	t.Helper()
+	select {
+	case response := <-done:
+		t.Fatalf("%s completed before X3 barrier release: status=%d body=%s", description, response.Code, response.Body.String())
+	default:
+	}
+}
+
+func receiveX3HTTPResponse(t *testing.T, description string, done <-chan *httptest.ResponseRecorder) *httptest.ResponseRecorder {
+	t.Helper()
+	select {
+	case response := <-done:
+		return response
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for %s", description)
+		return nil
+	}
+}
+
+func assertX3CommittedAllocation(t *testing.T, db *sql.DB, allocationID, subnetID int64, address, status, description string) {
+	t.Helper()
+	var gotStatus, gotAddress, gotDescription string
+	var gotSubnetID int64
+	var interfaceID sql.NullInt64
+	if err := db.QueryRow(`
+		SELECT subnet_id, host(address), status, interface_id, description
+		FROM ip_allocations
+		WHERE id = $1
+	`, allocationID).Scan(&gotSubnetID, &gotAddress, &gotStatus, &interfaceID, &gotDescription); err != nil {
+		t.Fatalf("read committed X3 allocation %d: %v", allocationID, err)
+	}
+	if gotSubnetID != subnetID || gotAddress != address || gotStatus != status || interfaceID.Valid || gotDescription != description {
+		t.Fatalf("committed X3 allocation = subnet:%d address:%s status:%s interface:%v description:%q; want subnet:%d address:%s status:%s NULL interface description:%q", gotSubnetID, gotAddress, gotStatus, interfaceID, gotDescription, subnetID, address, status, description)
+	}
+}
+
+func assertX3CommittedOldAllocation(t *testing.T, db *sql.DB, allocationID, subnetID int64, address, description string) {
+	t.Helper()
+	var count int
+	if err := db.QueryRow("SELECT COUNT(*) FROM ip_allocations WHERE id=$1", allocationID).Scan(&count); err != nil {
+		t.Fatalf("count committed X3 old allocation %d: %v", allocationID, err)
+	}
+	if count != 1 {
+		t.Fatalf("committed X3 old allocation count = %d, want 1", count)
+	}
+	assertX3CommittedAllocation(t, db, allocationID, subnetID, address, string(domain.AllocationStatusReserved), description)
+}
+
+func assertX3ResponseError(t *testing.T, response *httptest.ResponseRecorder, wantStatus int, wantCode, wantMessage string) {
+	t.Helper()
+	if response.Code != wantStatus {
+		t.Fatalf("HTTP status = %d, body = %s; want %d", response.Code, response.Body.String(), wantStatus)
+	}
+	var failure ipamhttp.ErrorResponse
+	if err := json.NewDecoder(response.Body).Decode(&failure); err != nil {
+		t.Fatalf("decode HTTP error response: %v", err)
+	}
+	if failure.Error.Code != wantCode || failure.Error.Message != wantMessage {
+		t.Fatalf("HTTP error = %#v; want code %q message %q", failure.Error, wantCode, wantMessage)
+	}
+}
+
+func TestM2Harden03ReserveVsUnreserveSameAddressDeterministicOrderings(t *testing.T) {
+	const (
+		cidr            = "10.140.0.0/24"
+		target          = "10.140.0.20"
+		replacementDesc = "X3 replacement reservation"
+		originalDesc    = "X3 original reservation"
+	)
+
+	t.Run("unreserve commit releases same-address reserve", func(t *testing.T) {
+		db := setupTestDB(t)
+		ctx := context.Background()
+		subnetRepo := postgres.NewSubnetRepository(db)
+		subnetService := service.NewSubnetService(subnetRepo)
+		allocationRepo := postgres.NewAllocationRepository(db)
+		mux := setupUnreservationTestMux(subnetRepo, allocationRepo)
+		subnet := createTestSubnet(t, subnetRepo, cidr, nil, "X3 commit")
+		oldID := insertAllocation(t, db, subnet.ID, target, domain.AllocationStatusReserved, nil, originalDesc)
+		assertX3UniqueAddressConstraint(t, db)
+
+		barrier := installX3AfterDeleteBarrier(t, db, oldID, false)
+		unreserveDone := make(chan *httptest.ResponseRecorder, 1)
+		go func() {
+			unreserveDone <- serveUnreservationRequest(mux, http.MethodDelete, fmt.Sprintf("/api/v1/ip-allocations/%d", oldID), "")
+		}()
+		unreservePID := waitForX3AdvisoryWaiterPID(t, db, barrier.holderPID)
+		if unreservePID == barrier.holderPID {
+			t.Fatalf("Unreserve PID %d is advisory holder PID", unreservePID)
+		}
+
+		reserveDone := make(chan *httptest.ResponseRecorder, 1)
+		body := fmt.Sprintf(`{"subnet_id":%d,"address":%q,"description":%q}`, subnet.ID, target, replacementDesc)
+		go func() {
+			reserveDone <- serveUnreservationRequest(mux, http.MethodPost, "/api/v1/ip-allocations", body)
+		}()
+		evidence := waitForX3InsertBlockedByPID(t, db, unreservePID)
+		if evidence.PID == unreservePID || evidence.WaitEvent == "" {
+			t.Fatalf("invalid X3 INSERT wait evidence: %+v", evidence)
+		}
+		t.Logf("X3 commit evidence: holderPID=%d unreservePID=%d reservePID=%d wait_event=%s ungranted_locks=%q blocking_pids=%q", barrier.holderPID, unreservePID, evidence.PID, evidence.WaitEvent, evidence.UngrantedLockTypes, evidence.BlockingPIDs)
+		assertX3HTTPPending(t, "Unreserve", unreserveDone)
+		assertX3HTTPPending(t, "Reserve", reserveDone)
+		if got := countAddressRows(t, db, target); got != 1 {
+			t.Fatalf("committed target row count while both transactions wait = %d, want 1", got)
+		}
+		assertX3CommittedOldAllocation(t, db, oldID, subnet.ID, target, originalDesc)
+
+		barrier.release(t)
+		unreserveResponse := receiveX3HTTPResponse(t, "Unreserve commit response", unreserveDone)
+		reserveResponse := receiveX3HTTPResponse(t, "Reserve replacement response", reserveDone)
+		if unreserveResponse.Code != http.StatusNoContent || unreserveResponse.Body.Len() != 0 {
+			t.Fatalf("Unreserve response = status %d body %q; want 204 empty", unreserveResponse.Code, unreserveResponse.Body.String())
+		}
+		if reserveResponse.Code != http.StatusCreated {
+			t.Fatalf("Reserve response = status %d body %s; want 201", reserveResponse.Code, reserveResponse.Body.String())
+		}
+		var created struct {
+			Data service.AllocationDTO `json:"data"`
+		}
+		if err := json.NewDecoder(reserveResponse.Body).Decode(&created); err != nil {
+			t.Fatalf("decode replacement response: %v", err)
+		}
+		if created.Data.ID <= 0 || created.Data.ID == oldID || created.Data.SubnetID != subnet.ID || created.Data.Address != target || created.Data.Status != string(domain.AllocationStatusReserved) || created.Data.InterfaceID != nil || created.Data.Description != replacementDesc {
+			t.Fatalf("replacement response = %#v", created.Data)
+		}
+		if got := countAddressRows(t, db, target); got != 1 {
+			t.Fatalf("final target row count = %d, want 1", got)
+		}
+		var oldCount, newCount, globalCount int
+		if err := db.QueryRow("SELECT COUNT(*) FILTER (WHERE id=$1), COUNT(*) FILTER (WHERE id=$2), COUNT(*) FROM ip_allocations", oldID, created.Data.ID).Scan(&oldCount, &newCount, &globalCount); err != nil {
+			t.Fatalf("count final X3 commit rows: %v", err)
+		}
+		if oldCount != 0 || newCount != 1 || globalCount != 1 {
+			t.Fatalf("final X3 commit counts = old:%d new:%d global:%d; want 0/1/1", oldCount, newCount, globalCount)
+		}
+		assertX3CommittedAllocation(t, db, created.Data.ID, subnet.ID, target, string(domain.AllocationStatusReserved), replacementDesc)
+		finalSubnet, err := subnetService.GetSubnet(ctx, subnet.ID)
+		if err != nil {
+			t.Fatalf("read final X3 commit subnet: %v", err)
+		}
+		if finalSubnet.ReservedCount != 1 {
+			t.Fatalf("final X3 commit ReservedCount = %d, want 1", finalSubnet.ReservedCount)
+		}
+	})
+
+	t.Run("unreserve rollback preserves old row and rejects reserve", func(t *testing.T) {
+		db := setupTestDB(t)
+		ctx := context.Background()
+		subnetRepo := postgres.NewSubnetRepository(db)
+		subnetService := service.NewSubnetService(subnetRepo)
+		allocationRepo := postgres.NewAllocationRepository(db)
+		mux := setupUnreservationTestMux(subnetRepo, allocationRepo)
+		subnet := createTestSubnet(t, subnetRepo, cidr, nil, "X3 rollback")
+		oldID := insertAllocation(t, db, subnet.ID, target, domain.AllocationStatusReserved, nil, originalDesc)
+		assertX3UniqueAddressConstraint(t, db)
+
+		barrier := installX3AfterDeleteBarrier(t, db, oldID, true)
+		unreserveDone := make(chan *httptest.ResponseRecorder, 1)
+		go func() {
+			unreserveDone <- serveUnreservationRequest(mux, http.MethodDelete, fmt.Sprintf("/api/v1/ip-allocations/%d", oldID), "")
+		}()
+		unreservePID := waitForX3AdvisoryWaiterPID(t, db, barrier.holderPID)
+
+		reserveDone := make(chan *httptest.ResponseRecorder, 1)
+		body := fmt.Sprintf(`{"subnet_id":%d,"address":%q,"description":%q}`, subnet.ID, target, replacementDesc)
+		go func() {
+			reserveDone <- serveUnreservationRequest(mux, http.MethodPost, "/api/v1/ip-allocations", body)
+		}()
+		evidence := waitForX3InsertBlockedByPID(t, db, unreservePID)
+		t.Logf("X3 rollback evidence: holderPID=%d unreservePID=%d reservePID=%d wait_event=%s ungranted_locks=%q blocking_pids=%q", barrier.holderPID, unreservePID, evidence.PID, evidence.WaitEvent, evidence.UngrantedLockTypes, evidence.BlockingPIDs)
+		assertX3HTTPPending(t, "Unreserve", unreserveDone)
+		assertX3HTTPPending(t, "Reserve", reserveDone)
+		if got := countAddressRows(t, db, target); got != 1 {
+			t.Fatalf("committed target row count while both transactions wait = %d, want 1", got)
+		}
+		assertX3CommittedOldAllocation(t, db, oldID, subnet.ID, target, originalDesc)
+
+		barrier.release(t)
+		unreserveResponse := receiveX3HTTPResponse(t, "Unreserve rollback response", unreserveDone)
+		reserveResponse := receiveX3HTTPResponse(t, "Reserve duplicate response", reserveDone)
+		assertX3ResponseError(t, unreserveResponse, http.StatusInternalServerError, "INTERNAL_ERROR", "An internal server error occurred.")
+		assertX3ResponseError(t, reserveResponse, http.StatusConflict, "IP_ALREADY_ALLOCATED", "The IP address is already allocated.")
+		if got := countAddressRows(t, db, target); got != 1 {
+			t.Fatalf("final target row count = %d, want 1", got)
+		}
+		var oldCount, globalCount int
+		if err := db.QueryRow("SELECT COUNT(*) FILTER (WHERE id=$1), COUNT(*) FROM ip_allocations", oldID).Scan(&oldCount, &globalCount); err != nil {
+			t.Fatalf("count final X3 rollback rows: %v", err)
+		}
+		if oldCount != 1 || globalCount != 1 {
+			t.Fatalf("final X3 rollback counts = old:%d global:%d; want 1/1", oldCount, globalCount)
+		}
+		assertX3CommittedOldAllocation(t, db, oldID, subnet.ID, target, originalDesc)
+		finalSubnet, err := subnetService.GetSubnet(ctx, subnet.ID)
+		if err != nil {
+			t.Fatalf("read final X3 rollback subnet: %v", err)
+		}
+		if finalSubnet.ReservedCount != 1 {
+			t.Fatalf("final X3 rollback ReservedCount = %d, want 1", finalSubnet.ReservedCount)
+		}
+	})
 }
 
 func TestAllocationReservePostgresIntegration(t *testing.T) {
